@@ -1,0 +1,14 @@
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/peersync-server ./cmd/peersync-server
+
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates wget
+COPY --from=build /out/peersync-server /usr/local/bin/peersync-server
+EXPOSE 8080/tcp 3478/udp
+USER nobody
+ENTRYPOINT ["peersync-server"]
+CMD ["--listen", ":8080", "--stun", ":3478"]

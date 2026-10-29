@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PeerSync</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="shell">
+  <header class="top">
+    <img class="logo" src="/logo.png" alt="">
+    <div class="brand">
+      <h1>PeerSync</h1>
+      <p>文件在设备之间直接同步，不经过服务器</p>
+    </div>
+    <div class="top-actions">
+      <span class="pill" id="pill"><i class="dot"></i>正在打开</span>
+      <button type="button" class="btn ghost" id="power" hidden>开始同步</button>
+    </div>
+  </header>
+  <div class="workspace">
+    <aside>
+      <div class="aside-h">
+        <h2>文件夹</h2>
+        <button type="button" class="btn tiny" id="btn-new">新建</button>
+      </div>
+      <ul id="shares" class="shares"></ul>
+      <div class="aside-f">
+        <button type="button" class="btn ghost wide" id="btn-join">用邀请码加入</button>
+        <button type="button" class="btn ghost wide" id="btn-device">这台设备</button>
+        <p class="version" id="version"></p>
+      </div>
+    </aside>
+    <main id="main">
+      <p class="muted">正在打开…</p>
+    </main>
+  </div>
+</div>
+<div id="modal-root" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

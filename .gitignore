@@ -1,0 +1,5 @@
+bin/
+build/
+data/
+*.exe
+.DS_Store

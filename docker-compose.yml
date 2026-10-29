@@ -1,0 +1,71 @@
+# Discovery server only. It does not see directory contents.
+# Start with: docker compose up -d --build
+services:
+  discovery:
+    image: peersync-server:latest
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.server
+    ports:
+      - "8080:8080"
+      - "3478:3478/udp"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Demo clients share one Docker network, so they connect directly.
+  # docker compose --profile demo up -d --build discovery client-a
+  # Copy INVITE= from `docker compose logs client-a`, then:
+  # PEERSYNC_INVITE=... docker compose --profile demo up -d client-b
+  client-a:
+    profiles: ["demo"]
+    image: peersync-client:latest
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.client
+    environment:
+      PEERSYNC_SERVER: ws://discovery:8080
+      PEERSYNC_NAME: client-a
+      PEERSYNC_PATH: /sync
+      PEERSYNC_CREATE: "1"
+      PEERSYNC_HOME: /config
+      PEERSYNC_UI: 0.0.0.0:8384
+      PEERSYNC_UI_TOKEN: ${PEERSYNC_UI_TOKEN:-}
+    ports:
+      - "8384:8384"
+    volumes:
+      - client-a:/config
+      - ./data/a:/sync
+    depends_on:
+      - discovery
+
+  client-b:
+    profiles: ["demo"]
+    image: peersync-client:latest
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.client
+    environment:
+      PEERSYNC_SERVER: ws://discovery:8080
+      PEERSYNC_NAME: client-b
+      PEERSYNC_PATH: /sync
+      PEERSYNC_INVITE: ${PEERSYNC_INVITE:-}
+      PEERSYNC_HOME: /config
+      PEERSYNC_UI: 0.0.0.0:8384
+      PEERSYNC_UI_TOKEN: ${PEERSYNC_UI_TOKEN:-}
+    volumes:
+      - client-b:/config
+      - ./data/b:/sync
+    ports:
+      - "42421:42420/tcp"
+      - "42421:42420/udp"
+      - "8385:8384"
+    depends_on:
+      - discovery
+
+volumes:
+  client-a:
+  client-b:
