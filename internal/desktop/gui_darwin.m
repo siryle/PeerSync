@@ -27,8 +27,16 @@ static NSString *pendingPageAction;
 
 static PeerSyncDelegate *appDelegate;
 
+@interface PeerSyncTextMenuItem : NSMenuItem
+@end
+
+@implementation PeerSyncTextMenuItem
+// AppKit can infer an action icon even when the stored image is nil.
+- (NSImage *)image { return nil; }
+@end
+
 static NSMenuItem *menuItem(NSString *title, SEL action, NSString *key) {
-	NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:key];
+	NSMenuItem *item = [[PeerSyncTextMenuItem alloc] initWithTitle:title action:action keyEquivalent:key];
 	if (action != NULL) item.target = appDelegate;
 	return item;
 }

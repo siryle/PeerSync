@@ -24,6 +24,11 @@ int main(int argc, char **argv) {
 		NSCAssert(foldersItem.submenu.numberOfItems == 2, @"Folder submenu missing");
 		NSCAssert([[foldersItem.submenu itemAtIndex:0].representedObject isEqual:@"/tmp/docs"], @"Folder path incorrect");
 		NSCAssert(statusItem.button.image.isTemplate, @"Status icon must follow system appearance");
+		for (NSMenu *menu in @[statusItem.menu, foldersItem.submenu]) {
+			for (NSMenuItem *item in menu.itemArray) {
+				NSCAssert(item.image == nil && item.indentationLevel == 0, @"Menu labels must align without row icons: %@", item.title);
+			}
+		}
 		NSCAssert([quitItem.keyEquivalent isEqualToString:@""], @"Quit must not bind Command-Q");
 		for (NSMenuItem *root in NSApp.mainMenu.itemArray) {
 			for (NSMenuItem *item in root.submenu.itemArray) {
