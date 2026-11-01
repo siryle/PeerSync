@@ -209,8 +209,9 @@ jobs:
           - \`ghcr.io/${OWNER}/peersync:${VERSION}\`
           EOF
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --target "$GITHUB_SHA" --title "PeerSync ${VERSION}" --notes-file NOTES.md --latest
+            gh release edit "$TAG" --target "$GITHUB_SHA" --title "PeerSync ${VERSION}" --notes-file NOTES.md
           else
-            gh release create "$TAG" --target "$GITHUB_SHA" --title "PeerSync ${VERSION}" --notes-file NOTES.md --latest
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "PeerSync ${VERSION}" --notes-file NOTES.md --draft
           fi
           gh release upload "$TAG" PeerSync-* SHA256SUMS.txt --clobber
+          gh release edit "$TAG" --draft=false --prerelease=false --latest
