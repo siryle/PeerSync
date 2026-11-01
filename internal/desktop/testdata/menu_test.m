@@ -7,7 +7,10 @@ static BOOL finishOnQuit;
 char *peerSyncMenuState(void) { return strdup(testState.UTF8String); }
 void peerSyncMenuAction(int action) {
 	lastAction = action;
-	if (finishOnQuit && action == PeerSyncQuit) psFinishQuit();
+	if (finishOnQuit && action == PeerSyncQuit) {
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+			dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ psFinishQuit(); });
+	}
 }
 
 int main(int argc, char **argv) {
@@ -76,13 +79,18 @@ int main(int argc, char **argv) {
 
 		finishOnQuit = YES;
 		testState = @"{\"title\":\"同步运行中\",\"running\":true,\"folders\":[]}";
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-			[mainWindow performClose:nil];
-			NSCAssert(NSApp.isRunning && !mainWindow.isVisible, @"Hidden window must leave the app running");
-			[appDelegate quit:nil];
-		});
-		psRunApp("PeerSync test", "about:blank", NULL, 0);
-		NSCAssert(NSApp.delegate == nil && statusItem == nil, @"Menu quit must return and clean up the app loop");
+		for (NSNumber *tracking in @[@NO, @YES]) {
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+				[mainWindow performClose:nil];
+				NSCAssert(NSApp.isRunning && !mainWindow.isVisible, @"Hidden window must leave the app running");
+				[appDelegate quit:nil];
+				if (tracking.boolValue) {
+					[statusItem.menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(100, 400) inView:nil];
+				}
+			});
+			psRunApp("PeerSync test", "about:blank", NULL, 0);
+			NSCAssert(NSApp.delegate == nil && statusItem == nil, @"Menu quit must return and clean up the app loop");
+		}
 	}
 	return 0;
 }

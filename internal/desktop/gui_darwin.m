@@ -307,7 +307,9 @@ void psRunApp(const char *title, const char *url, const void *icon, int iconLen)
 }
 
 void psFinishQuit(void) {
-	dispatch_async(dispatch_get_main_queue(), ^{
+	// Menu tracking runs a nested loop that can defer main-queue blocks.
+	CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+		[statusItem.menu cancelTracking];
 		if (NSApp.modalWindow != nil) {
 			[NSApp.modalWindow orderOut:nil];
 			[NSApp stopModalWithCode:NSModalResponseCancel];
@@ -317,6 +319,7 @@ void psFinishQuit(void) {
 			modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0];
 		[NSApp postEvent:wake atStart:YES];
 	});
+	CFRunLoopWakeUp(CFRunLoopGetMain());
 }
 
 char *psPickFolder(void) {

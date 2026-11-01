@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"os"
@@ -118,7 +119,9 @@ func TestMacMenuNative(t *testing.T) {
 	if out, err := compile.CombinedOutput(); err != nil {
 		t.Fatalf("compile native menu test: %v\n%s", err, out)
 	}
-	if out, err := exec.Command(bin, t.TempDir()).CombinedOutput(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, bin, t.TempDir()).CombinedOutput(); err != nil {
 		t.Fatalf("native menu test: %v\n%s", err, out)
 	}
 }
