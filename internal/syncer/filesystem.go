@@ -3,11 +3,29 @@ package syncer
 import (
 	"errors"
 	"os"
+	"time"
 
+	"github.com/netcraft/peersync/internal/proto"
 	"github.com/netcraft/peersync/internal/vclock"
 )
 
 var errIgnored = errors.New("path is ignored")
+
+func (e *Engine) setMetadata(rel string, r proto.Entry) (os.FileInfo, error) {
+	if err := e.root.Chmod(rel, fileMode(r.Mode, r.IsDir)); err != nil {
+		return nil, err
+	}
+	if !r.IsDir {
+		mtime := time.Unix(0, r.ModTime)
+		if r.ModTime == 0 {
+			mtime = time.Now()
+		}
+		if err := e.root.Chtimes(rel, mtime, mtime); err != nil {
+			return nil, err
+		}
+	}
+	return e.root.Lstat(rel)
+}
 
 // openFile confines reads to the share and never reads a pipe or device.
 func (e *Engine) openFile(rel string) (*os.File, error) {

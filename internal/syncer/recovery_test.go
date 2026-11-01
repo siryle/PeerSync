@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,25 +16,30 @@ import (
 	"github.com/netcraft/peersync/internal/vclock"
 )
 
-func connectEngines(t *testing.T, a, b *Engine, note func(Note)) {
+func connectEngines(t *testing.T, a, b *Engine, note func(Note)) func() {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	left, right := net.Pipe()
 	stopped := make(chan error, 2)
 	go func() { stopped <- Serve(ctx, a, frame.New(left), nil, nil) }()
 	go func() { stopped <- Serve(ctx, b, frame.New(right), nil, note) }()
-	t.Cleanup(func() {
-		cancel()
-		_ = left.Close()
-		_ = right.Close()
-		for i := 0; i < 2; i++ {
-			select {
-			case <-stopped:
-			case <-time.After(5 * time.Second):
-				t.Error("session did not stop")
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			_ = left.Close()
+			_ = right.Close()
+			for i := 0; i < 2; i++ {
+				select {
+				case <-stopped:
+				case <-time.After(5 * time.Second):
+					t.Error("session did not stop")
+				}
 			}
-		}
-	})
+		})
+	}
+	t.Cleanup(stop)
+	return stop
 }
 
 func TestConcurrentEditsConverge(t *testing.T) {

@@ -176,6 +176,7 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 	if err := e.Scan(); err != nil {
 		e.Log.Warn("scan", "err", err, "root", e.Root)
 	}
+	verified := time.Now()
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -208,8 +209,12 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 			}
 			e.Log.Debug("watch", "err", err)
 		case <-timer.C:
-			if err := e.Scan(); err != nil {
+			// Periodically verify bytes even when a writer preserved size and mtime.
+			full := time.Since(verified) >= 5*time.Minute
+			if err := e.scan(full); err != nil {
 				e.Log.Warn("scan", "err", err, "root", e.Root)
+			} else if full {
+				verified = time.Now()
 			}
 			e.watchAll(watcher)
 			timer.Reset(every)
@@ -250,8 +255,12 @@ func kqueueOS() bool {
 	}
 }
 
-// Scan refreshes the index from disk.
+// Scan refreshes the index and verifies all file contents.
 func (e *Engine) Scan() error {
+	return e.scan(true)
+}
+
+func (e *Engine) scan(full bool) error {
 	ig := e.ignores()
 	type item struct {
 		rel   string
@@ -351,7 +360,7 @@ func (e *Engine) Scan() error {
 			continue
 		}
 		prev := snap[it.rel]
-		if prev != nil && !prev.Deleted && !prev.IsDir && prev.Size == it.size && prev.ModTime == it.mtime && len(prev.Blocks) == BlocksForSize(it.size) {
+		if !full && prev != nil && !prev.Deleted && !prev.IsDir && prev.Size == it.size && prev.ModTime == it.mtime && len(prev.Blocks) == BlocksForSize(it.size) {
 			continue
 		}
 		sum, blocks, size, err := e.hashFile(it.rel)
@@ -391,6 +400,8 @@ func (e *Engine) Scan() error {
 		prev := e.idx.Files[it.rel]
 		if prev != nil && !prev.Deleted && prev.Mode != it.mode {
 			prev.Mode = it.mode
+			prev.Version = vclock.Bump(prev.Version, e.Self)
+			changed = true
 		}
 	}
 	for rel, f := range e.idx.Files {
@@ -449,8 +460,12 @@ func (e *Engine) ignores() ignore.Set {
 func (e *Engine) upsertDir(rel string, mode uint32) bool {
 	prev := e.idx.Files[rel]
 	if prev != nil && !prev.Deleted && prev.IsDir {
+		if prev.Mode == mode {
+			return false
+		}
 		prev.Mode = mode
-		return false
+		prev.Version = vclock.Bump(prev.Version, e.Self)
+		return true
 	}
 	ver := vclock.Vector{}
 	if prev != nil {
@@ -462,7 +477,7 @@ func (e *Engine) upsertDir(rel string, mode uint32) bool {
 
 func (e *Engine) upsertFile(rel string, size, mtime int64, mode uint32, sum [32]byte, blocks [][32]byte) bool {
 	prev := e.idx.Files[rel]
-	if prev != nil && !prev.Deleted && !prev.IsDir && prev.Sum == sum {
+	if prev != nil && !prev.Deleted && !prev.IsDir && prev.Sum == sum && prev.ModTime == mtime && prev.Mode == mode {
 		prev.Size = size
 		prev.ModTime = mtime
 		prev.Mode = mode
@@ -610,6 +625,16 @@ func (e *Engine) ApplyMerge(task Task) error {
 	if cur == nil {
 		return nil
 	}
+	if task.Metadata {
+		info, err := e.setMetadata(task.Path, task.Remote)
+		if err != nil {
+			return err
+		}
+		cur.Mode = uint32(info.Mode().Perm())
+		if !cur.IsDir {
+			cur.ModTime = info.ModTime().UnixNano()
+		}
+	}
 	cur.Version = vclock.Clone(task.Version)
 	e.idx.Seq++
 	return e.persistLocked()
@@ -633,7 +658,11 @@ func (e *Engine) ApplyDir(task Task) error {
 	if err := e.root.MkdirAll(task.Path, fileMode(task.Remote.Mode, true)); err != nil {
 		return err
 	}
-	e.idx.Files[task.Path] = &File{IsDir: true, Mode: task.Remote.Mode, Version: vclock.Clone(task.Version)}
+	info, err := e.setMetadata(task.Path, task.Remote)
+	if err != nil {
+		return err
+	}
+	e.idx.Files[task.Path] = &File{IsDir: true, Mode: uint32(info.Mode().Perm()), Version: vclock.Clone(task.Version)}
 	e.idx.Seq++
 	return e.persistLocked()
 }
@@ -645,9 +674,13 @@ func (e *Engine) stageConflictLocked(task Task) error {
 		return errStale
 	}
 	// A retry must find the same backup instead of producing another conflict.
-	stamp := time.Unix(0, cur.ModTime)
+	base := conflictName(task.Path, cur)
 	for i := 0; i < 100; i++ {
-		name := conflictName(task.Path, e.Self, stamp.Add(time.Duration(i)*time.Millisecond))
+		name := base
+		if i > 0 {
+			ext := path.Ext(base)
+			name = strings.TrimSuffix(base, ext) + "-" + strconv.Itoa(i) + ext
+		}
 		if !ValidRel(name) {
 			return errors.New("conflict path too long")
 		}
@@ -679,13 +712,13 @@ func (e *Engine) stageConflictLocked(task Task) error {
 		if err == nil {
 			sum, blocks, size, err = HashReader(out)
 		}
-		info, statErr := out.Stat()
 		closeErr := out.Close()
 		if err == nil {
-			err = statErr
-		}
-		if err == nil {
 			err = closeErr
+		}
+		var info os.FileInfo
+		if err == nil {
+			info, err = e.setMetadata(name, proto.Entry{Mode: cur.Mode, ModTime: cur.ModTime})
 		}
 		if err == nil && (sum != cur.Sum || size != cur.Size) {
 			err = errStale
@@ -738,22 +771,26 @@ func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error 
 	if err := e.root.MkdirAll(path.Dir(task.Path), 0o755); err != nil {
 		return err
 	}
-	mode := fileMode(task.Remote.Mode, false)
-	mtime := time.Unix(0, task.Remote.ModTime)
-	if task.Remote.ModTime == 0 {
-		mtime = time.Now()
-	}
-	if err := e.root.Chmod(tmp, mode); err != nil && !errors.Is(err, os.ErrPermission) {
+	info, err := e.setMetadata(tmp, task.Remote)
+	if err != nil {
 		return err
 	}
-	if err := e.root.Chtimes(tmp, mtime, mtime); err != nil {
-		return err
+	cur := e.idx.Files[task.Path]
+	replacingDir := cur != nil && !cur.Deleted && cur.IsDir
+	if replacingDir {
+		// Remove only an empty directory; unsynced children must survive.
+		if err := e.root.Remove(task.Path); err != nil {
+			return err
+		}
 	}
 	if err := e.root.Rename(tmp, task.Path); err != nil {
+		if replacingDir {
+			return errors.Join(err, e.root.Mkdir(task.Path, fileMode(cur.Mode, true)))
+		}
 		return err
 	}
 	e.idx.Files[task.Path] = &File{
-		Size: task.Remote.Size, ModTime: mtime.UnixNano(), Mode: uint32(mode),
+		Size: task.Remote.Size, ModTime: info.ModTime().UnixNano(), Mode: uint32(info.Mode().Perm()),
 		Sum: sum, Blocks: blocks, Version: vclock.Clone(task.Version),
 	}
 	e.idx.Seq++
@@ -860,12 +897,11 @@ func fileMode(m uint32, dir bool) os.FileMode {
 	return perm
 }
 
-func conflictName(rel, device string, now time.Time) string {
+func conflictName(rel string, f *File) string {
 	ext := path.Ext(rel)
 	base := rel[:len(rel)-len(ext)]
-	short := device
-	if len(short) > 8 {
-		short = short[:8]
-	}
-	return base + ".sync-conflict-" + short + "-" + strconv.FormatInt(now.UnixMilli(), 10) + ext
+	// JSON sorts vector keys, so every replica names the same losing version alike.
+	version, _ := json.Marshal(f.Version)
+	digest := sha256.Sum256(append(f.Sum[:], version...))
+	return base + fmt.Sprintf(".sync-conflict-%x", digest[:16]) + ext
 }

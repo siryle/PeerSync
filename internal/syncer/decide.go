@@ -19,12 +19,13 @@ const (
 
 // Task is one thing to do to make the local folder match a remote index.
 type Task struct {
-	Op      string
-	Path    string
-	Version vclock.Vector
-	Seen    vclock.Vector
-	Had     bool
-	Remote  proto.Entry
+	Op       string
+	Path     string
+	Version  vclock.Vector
+	Seen     vclock.Vector
+	Had      bool
+	Metadata bool // Apply the remote attributes along with the merged version.
+	Remote   proto.Entry
 }
 
 // Plan compares the local index with a peer's index.
@@ -70,6 +71,7 @@ func decide(self string, local *File, r proto.Entry) []Task {
 	case -1:
 		if !local.Deleted && !r.Deleted && !local.IsDir && !r.IsDir && sameSum(local.Sum, r.Sum) {
 			base.Op = opMerge
+			base.Metadata = true
 			base.Version = vclock.Clone(r.Version)
 			return []Task{base}
 		}
@@ -116,11 +118,13 @@ func concurrent(self string, local *File, base Task, r proto.Entry) []Task {
 	}
 	if local.IsDir && r.IsDir {
 		base.Op = opMerge
+		base.Metadata = local.Mode < r.Mode
 		base.Version = merged
 		return []Task{base}
 	}
 	if !local.IsDir && !r.IsDir && sameSum(local.Sum, r.Sum) {
 		base.Op = opMerge
+		base.Metadata = local.ModTime < r.ModTime || (local.ModTime == r.ModTime && local.Mode < r.Mode)
 		base.Version = merged
 		return []Task{base}
 	}
