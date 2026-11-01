@@ -244,15 +244,84 @@ function setBusy(btn, busy, label) {
 
 async function chooseFolder(input) {
   const btn = $("pick");
+  const error = $("dlg-error");
+  error.textContent = "";
   setBusy(btn, true, "选择");
   try {
     const res = await api("/api/pick", {});
+    if (!input.isConnected) return;
+    if (res.browse) openFolderBrowser(input);
     if (res.path) input.value = res.path;
   } catch (err) {
-    $("dlg-error").textContent = err.message;
+    error.textContent = err.message;
   } finally {
     setBusy(btn, false, "选择");
   }
+}
+
+function openFolderBrowser(input) {
+  const browser = $("folder-browser");
+  browser.hidden = false;
+  browser.innerHTML = `
+    <p class="muted">选择运行 PeerSync 的设备上的目录。Docker 中只显示容器内可见的目录。</p>
+    <div class="folder-toolbar">
+      <button type="button" class="btn ghost tiny" id="folder-home">起始目录</button>
+      <button type="button" class="btn ghost tiny" id="folder-up" disabled>上一级</button>
+    </div>
+    <p class="folder-path" id="folder-path"></p>
+    <ul class="folder-list" id="folder-list" aria-label="子文件夹" aria-busy="true"></ul>
+    <p class="form-error" id="folder-error" role="status"></p>
+    <div class="dialog-actions">
+      <button type="button" class="btn ghost" id="folder-cancel">收起</button>
+      <button type="button" class="btn" id="folder-use" disabled>使用此文件夹</button>
+    </div>`;
+  const list = browser.querySelector("#folder-list");
+  const path = browser.querySelector("#folder-path");
+  const error = browser.querySelector("#folder-error");
+  const up = browser.querySelector("#folder-up");
+  const use = browser.querySelector("#folder-use");
+  let request = 0;
+  async function load(target) {
+    const current = ++request;
+    error.textContent = "";
+    path.textContent = target;
+    up.disabled = use.disabled = true;
+    list.setAttribute("aria-busy", "true");
+    list.innerHTML = '<li class="muted">正在读取目录…</li>';
+    try {
+      const res = await api("/api/folders?path=" + encodeURIComponent(target));
+      if (current !== request || !list.isConnected || browser.hidden) return;
+      path.textContent = res.path;
+      list.innerHTML = res.folders.length
+        ? res.folders.map((dir) => `<li><button type="button" data-path="${esc(dir.path)}">${esc(dir.name)}</button></li>`).join("")
+        : '<li class="muted">没有子文件夹，可以直接使用此文件夹。</li>';
+      list.querySelectorAll("button").forEach((btn) => {
+        btn.onclick = () => load(btn.dataset.path);
+      });
+      up.disabled = res.parent === res.path;
+      up.onclick = () => load(res.parent);
+      use.disabled = false;
+      use.onclick = () => {
+        input.value = res.path;
+        browser.hidden = true;
+        input.focus();
+      };
+      up.focus();
+      if (up.disabled) use.focus();
+    } catch (err) {
+      if (current !== request || !list.isConnected || browser.hidden) return;
+      list.innerHTML = "";
+      error.textContent = err.message;
+    } finally {
+      if (current === request) list.setAttribute("aria-busy", "false");
+    }
+  }
+  browser.querySelector("#folder-home").onclick = () => load("");
+  browser.querySelector("#folder-cancel").onclick = () => {
+    browser.hidden = true;
+    $("pick").focus();
+  };
+  load(input.value);
 }
 
 function pathField(id) {
@@ -261,7 +330,8 @@ function pathField(id) {
     <div class="path-row">
       <input id="${id}" name="path" spellcheck="false" placeholder="选择或填写一个文件夹">
       <button type="button" class="btn ghost" id="pick">选择</button>
-    </div>`;
+    </div>
+    <section class="folder-browser" id="folder-browser" aria-label="选择文件夹" hidden></section>`;
 }
 
 function openCreate() {
@@ -498,7 +568,14 @@ $("power").onclick = async () => {
 };
 
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape" && modalOpen) closeModal();
+  if (ev.key !== "Escape" || !modalOpen) return;
+  const browser = $("folder-browser");
+  if (browser && !browser.hidden) {
+    browser.hidden = true;
+    $("pick").focus();
+  } else {
+    closeModal();
+  }
 });
 
 refresh();

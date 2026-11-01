@@ -346,6 +346,8 @@ h2.folder {
 
 .dialog {
   width: min(480px, 100%);
+  max-height: calc(100dvh - 48px);
+  overflow-y: auto;
   background: var(--card);
   color: var(--ink);
   border-radius: 20px;
@@ -386,7 +388,39 @@ textarea {
 
 .path-row { display: flex; gap: 8px; }
 
-.path-row input { flex: 1; }
+.path-row input { flex: 1; min-width: 0; }
+
+.folder-browser { margin-top: 16px; }
+
+.folder-toolbar { display: flex; gap: 8px; }
+
+.dialog .folder-path { margin: 10px 0; overflow-wrap: anywhere; }
+
+.folder-list {
+  max-height: 200px;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-block: 1px solid var(--line);
+}
+
+.folder-list li { border-bottom: 1px solid var(--line); }
+.folder-list li:last-child { border-bottom: 0; }
+.folder-list li.muted { padding: 12px; }
+
+.folder-list button {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 12px;
+  text-align: left;
+  overflow-wrap: anywhere;
+  border: 0;
+  background: transparent;
+}
+
+.folder-list button:hover, .folder-list button:focus-visible { background: var(--soft); }
+.dialog .folder-browser .form-error { color: var(--danger); margin-top: 8px; }
 
 .dialog-actions {
   display: flex;

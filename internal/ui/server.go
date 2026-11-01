@@ -111,6 +111,10 @@ func handler(c *Controller, token string) http.Handler {
 		writeJSON(w, http.StatusOK, c.State())
 	}))
 	mux.HandleFunc("POST /api/pick", apiWith(token, func(w http.ResponseWriter, r *http.Request) {
+		if c.pick == nil {
+			writeJSON(w, http.StatusOK, map[string]bool{"browse": true})
+			return
+		}
 		path, err := c.PickFolder()
 		if errors.Is(err, ErrCancelled) {
 			writeJSON(w, http.StatusOK, map[string]string{"path": ""})
@@ -121,6 +125,14 @@ func handler(c *Controller, token string) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"path": path})
+	}))
+	mux.HandleFunc("GET /api/folders", apiWith(token, func(w http.ResponseWriter, r *http.Request) {
+		folders, err := listFolders(r.URL.Query().Get("path"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, folders)
 	}))
 	mux.HandleFunc("POST /api/shares", apiWith(token, func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
