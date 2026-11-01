@@ -47,7 +47,9 @@ int main(int argc, char **argv) {
 		[mainWindow performClose:nil];
 		NSCAssert(!mainWindow.isVisible && mainWindow.contentView != nil, @"Closing must hide and retain the window");
 		NSCAssert(![appDelegate applicationShouldTerminateAfterLastWindowClosed:NSApp], @"Window close must not terminate");
-		NSCAssert([appDelegate applicationShouldTerminate:NSApp] == NSTerminateCancel, @"Other termination requests must be rejected");
+		lastAction = 0;
+		NSCAssert([appDelegate applicationShouldTerminate:NSApp] == NSTerminateCancel, @"Termination must wait for asynchronous cleanup");
+		NSCAssert(lastAction == PeerSyncQuit, @"Dock quit must stop sync through the shared quit action");
 		[appDelegate applicationShouldHandleReopen:NSApp hasVisibleWindows:NO];
 		NSCAssert(mainWindow.isVisible, @"Dock reopen must restore the window");
 		[appDelegate hideWindow:nil];
@@ -79,17 +81,22 @@ int main(int argc, char **argv) {
 
 		finishOnQuit = YES;
 		testState = @"{\"title\":\"同步运行中\",\"running\":true,\"folders\":[]}";
-		for (NSNumber *tracking in @[@NO, @YES]) {
+		for (NSNumber *route in @[@0, @1, @2]) {
 			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
 				[mainWindow performClose:nil];
 				NSCAssert(NSApp.isRunning && !mainWindow.isVisible, @"Hidden window must leave the app running");
-				[appDelegate quit:nil];
-				if (tracking.boolValue) {
+				if (route.intValue == 2) {
+					[NSApp terminate:nil];
+					NSCAssert(NSApp.isRunning, @"Dock quit must allow asynchronous cleanup before the app loop stops");
+				} else {
+					[appDelegate quit:nil];
+				}
+				if (route.intValue == 1) {
 					[statusItem.menu popUpMenuPositioningItem:nil atLocation:NSMakePoint(100, 400) inView:nil];
 				}
 			});
 			psRunApp("PeerSync test", "about:blank", NULL, 0);
-			NSCAssert(NSApp.delegate == nil && statusItem == nil, @"Menu quit must return and clean up the app loop");
+			NSCAssert(NSApp.delegate == nil && statusItem == nil, @"Menu and Dock quit must return and clean up the app loop");
 		}
 	}
 	return 0;

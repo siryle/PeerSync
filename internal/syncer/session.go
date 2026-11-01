@@ -9,13 +9,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/netcraft/peersync/internal/config"
 	"github.com/netcraft/peersync/internal/frame"
 	"github.com/netcraft/peersync/internal/proto"
 )
 
 // Serve runs directory sync on an already authenticated connection until it
 // fails or ctx is cancelled.
-func Serve(ctx context.Context, e *Engine, conn *frame.Conn, log *slog.Logger, note func(Note)) error {
+func Serve(ctx context.Context, e *Engine, conn *frame.Conn, log *slog.Logger, note func(Note), peerID ...string) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if log == nil {
@@ -28,8 +29,11 @@ func Serve(ctx context.Context, e *Engine, conn *frame.Conn, log *slog.Logger, n
 		log:        log,
 		note:       note,
 		pending:    map[uint32]*waiter{},
-		indexReady: make(chan []proto.Entry, 1),
+		indexReady: make(chan indexUpdate, 1),
 		blobSem:    make(chan struct{}, 16),
+	}
+	if len(peerID) > 0 {
+		s.peerID = peerID[0]
 	}
 	sub, unsub := e.Subscribe()
 	defer unsub()
@@ -67,7 +71,8 @@ type session struct {
 	log        *slog.Logger
 	note       func(Note)
 	next       atomic.Uint32
-	indexReady chan []proto.Entry
+	indexReady chan indexUpdate
+	peerID     string
 	blobSem    chan struct{}
 	retry      atomic.Bool
 	work       sync.WaitGroup
@@ -83,6 +88,12 @@ type indexAsm struct {
 	seq   uint64
 	total int
 	parts map[int][]proto.Entry
+	mode  config.SyncMode
+}
+
+type indexUpdate struct {
+	entries []proto.Entry
+	mode    config.SyncMode
 }
 
 func (s *session) readLoop() error {
@@ -137,7 +148,25 @@ func (s *session) pingLoop() error {
 
 func (s *session) syncLoop(sub <-chan struct{}) error {
 	var remote []proto.Entry
+	var mode config.SyncMode
 	var have bool
+	var sourceWarned bool
+	reconcile := func() {
+		if s.e.Mode == config.ReceiveOnly {
+			if s.peerID != s.e.SourceID {
+				return
+			}
+			if mode != config.SendOnly {
+				if !sourceWarned && s.note != nil {
+					s.note(Note{Op: "fail", Path: "同步模式", Detail: "来源设备需要设为仅发送，暂未接收文件"})
+				}
+				sourceWarned = true
+				return
+			}
+			sourceWarned = false
+		}
+		s.reconcile(remote)
+	}
 	// nil once the first readable scan has finished. Until then the index
 	// may still be the previous run's tombstones, and announcing it would
 	// delete the peer's copies.
@@ -150,7 +179,7 @@ func (s *session) syncLoop(sub <-chan struct{}) error {
 			return s.ctx.Err()
 		case <-retry.C:
 			if ready == nil && have && s.retry.Swap(false) {
-				s.reconcile(remote)
+				reconcile()
 			}
 		case <-ready:
 			ready = nil
@@ -158,7 +187,7 @@ func (s *session) syncLoop(sub <-chan struct{}) error {
 				return err
 			}
 			if have {
-				s.reconcile(remote)
+				reconcile()
 			}
 		case <-sub:
 			if ready != nil {
@@ -168,21 +197,24 @@ func (s *session) syncLoop(sub <-chan struct{}) error {
 				return err
 			}
 			if have {
-				s.reconcile(remote)
+				reconcile()
 			}
-		case entries := <-s.indexReady:
-			remote = entries
+		case update := <-s.indexReady:
+			remote, mode = update.entries, update.mode
 			have = true
 			if ready != nil {
 				continue
 			}
-			s.reconcile(remote)
+			reconcile()
 		}
 	}
 }
 
 func (s *session) sendIndex() error {
-	_, entries := s.e.Entries()
+	var entries []proto.Entry
+	if s.e.Mode != config.ReceiveOnly {
+		_, entries = s.e.Entries()
+	}
 	const pageSize = 40
 	total := (len(entries) + pageSize - 1) / pageSize
 	if total == 0 {
@@ -199,7 +231,7 @@ func (s *session) sendIndex() error {
 			}
 			chunk = entries[from:to]
 		}
-		body, err := json.Marshal(proto.IndexPage{Seq: seq, Part: part, Total: total, Entries: chunk})
+		body, err := json.Marshal(proto.IndexPage{Seq: seq, Part: part, Total: total, Entries: chunk, Mode: string(s.e.Mode)})
 		if err != nil {
 			return err
 		}
@@ -218,7 +250,10 @@ func (s *session) onIndex(payload []byte) {
 	s.asmMu.Lock()
 	defer s.asmMu.Unlock()
 	if s.asm.seq != page.Seq || s.asm.total != page.Total || s.asm.parts == nil {
-		s.asm = indexAsm{seq: page.Seq, total: page.Total, parts: map[int][]proto.Entry{}}
+		s.asm = indexAsm{seq: page.Seq, total: page.Total, parts: map[int][]proto.Entry{}, mode: config.SyncMode(page.Mode).Effective()}
+	}
+	if s.asm.mode != config.SyncMode(page.Mode).Effective() {
+		return
 	}
 	s.asm.parts[page.Part] = page.Entries
 	if len(s.asm.parts) < page.Total {
@@ -234,14 +269,14 @@ func (s *session) onIndex(payload []byte) {
 	}
 	s.asm.parts = nil
 	select {
-	case s.indexReady <- all:
+	case s.indexReady <- indexUpdate{entries: all, mode: s.asm.mode}:
 	default:
 		select {
 		case <-s.indexReady:
 		default:
 		}
 		select {
-		case s.indexReady <- all:
+		case s.indexReady <- indexUpdate{entries: all, mode: s.asm.mode}:
 		default:
 		}
 	}
@@ -294,6 +329,9 @@ func (s *session) done(task Task, err error) {
 	if err != nil {
 		s.note(Note{Op: "fail", Path: task.Path, Detail: err.Error()})
 		return
+	}
+	if task.Backup {
+		s.note(Note{Op: "backup", Path: task.Path})
 	}
 	if task.Op == opMerge {
 		return

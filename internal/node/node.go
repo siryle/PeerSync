@@ -251,6 +251,14 @@ func prepare(ctx context.Context, opt Options) (*Node, error) {
 }
 
 func (n *Node) addShare(sh config.Share) error {
+	if sh.Mode == config.ReceiveOnly {
+		if _, err := identity.ParseDeviceID(sh.SourceID); err != nil {
+			return err
+		}
+		if sh.SourceID == n.id.DeviceID() {
+			return errors.New("receive-only source must be another device")
+		}
+	}
 	key, err := invite.ParseKey(sh.ShareKey)
 	if err != nil {
 		return err
@@ -265,7 +273,8 @@ func (n *Node) addShare(sh config.Share) error {
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		return err
 	}
-	eng, err := syncer.Open(abs, config.IndexPath(n.home, sh.ShareID), n.id.DeviceID(), n.log)
+	eng, err := syncer.Open(abs, config.IndexPath(n.home, sh.ShareID), n.id.DeviceID(), n.log,
+		syncer.Options{Mode: sh.Mode, SourceID: sh.SourceID})
 	if err != nil {
 		return err
 	}

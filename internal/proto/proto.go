@@ -78,6 +78,7 @@ type IndexPage struct {
 	Part    int     `json:"part"`
 	Total   int     `json:"total"`
 	Entries []Entry `json:"entries"`
+	Mode    string  `json:"mode,omitempty"`
 }
 
 // MetaReq asks for the block hashes of one file.

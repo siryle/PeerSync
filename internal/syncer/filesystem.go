@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/netcraft/peersync/internal/config"
 	"github.com/netcraft/peersync/internal/proto"
 	"github.com/netcraft/peersync/internal/vclock"
 )
@@ -93,7 +94,7 @@ func (e *Engine) checkLocalLocked(task Task) error {
 		if cur == nil || cur.Deleted {
 			return nil
 		}
-		e.idx.Files[task.Path] = &File{Deleted: true, IsDir: cur.IsDir, Version: vclock.Bump(cur.Version, e.Self)}
+		e.idx.Files[task.Path] = &File{Deleted: true, IsDir: cur.IsDir, Version: vclock.Bump(cur.Version, e.Self), Local: e.Mode == config.ReceiveOnly}
 		changed = true
 	case err != nil:
 		return err

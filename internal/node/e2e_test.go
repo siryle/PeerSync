@@ -9,10 +9,17 @@ import (
 
 	"github.com/netcraft/peersync/internal/config"
 	"github.com/netcraft/peersync/internal/discover"
+	"github.com/netcraft/peersync/internal/identity"
 	"github.com/netcraft/peersync/internal/invite"
+	"github.com/netcraft/peersync/internal/syncer"
 )
 
 func TestDirectorySyncDoesNotUseServer(t *testing.T) {
+	t.Run("bidirectional", func(t *testing.T) { testDirectorySync(t, false) })
+	t.Run("one-way", func(t *testing.T) { testDirectorySync(t, true) })
+}
+
+func testDirectorySync(t *testing.T, oneWay bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	srv := &discover.Server{Listen: "127.0.0.1:0", Stun: "127.0.0.1:0"}
@@ -33,6 +40,10 @@ func TestDirectorySyncDoesNotUseServer(t *testing.T) {
 	homeB := t.TempDir()
 	dirA := t.TempDir()
 	dirB := t.TempDir()
+	idA, err := identity.LoadOrCreate(filepath.Join(homeA, config.IdentityFile))
+	if err != nil {
+		t.Fatal(err)
+	}
 	save := func(home, path, name string) {
 		cfg := config.Default(name)
 		cfg.Server = serverURL
@@ -40,6 +51,13 @@ func TestDirectorySyncDoesNotUseServer(t *testing.T) {
 		cfg.Shares = []config.Share{{
 			Label: "docs", Path: path, ShareID: shareID, ShareKey: key,
 		}}
+		if oneWay {
+			cfg.Shares[0].Mode = config.SendOnly
+			if home == homeB {
+				cfg.Shares[0].Mode = config.ReceiveOnly
+				cfg.Shares[0].SourceID = idA.DeviceID()
+			}
+		}
 		if err := config.Save(filepath.Join(home, config.FileName), cfg); err != nil {
 			t.Fatal(err)
 		}
@@ -74,7 +92,17 @@ func TestDirectorySyncDoesNotUseServer(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dirB, "nested", "note.txt"), edited, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	waitFile(t, filepath.Join(dirA, "nested", "note.txt"), edited)
+	if oneWay {
+		waitFile(t, filepath.Join(dirB, "nested", "note.txt"), payload)
+		waitFile(t, filepath.Join(dirA, "nested", "note.txt"), payload)
+		items, err := syncer.ListConflicts(config.IndexPath(homeB, shareID))
+		if err != nil || len(items) != 1 {
+			t.Fatalf("receiver backup: %+v, %v", items, err)
+		}
+		waitFile(t, filepath.Join(syncer.ConflictDir(config.IndexPath(homeB, shareID)), items[0].ID+".data"), edited)
+	} else {
+		waitFile(t, filepath.Join(dirA, "nested", "note.txt"), edited)
+	}
 
 	if err := os.Remove(filepath.Join(dirA, "nested", "note.txt")); err != nil {
 		t.Fatal(err)

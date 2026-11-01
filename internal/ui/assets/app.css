@@ -52,7 +52,7 @@ body {
   line-height: 1.45;
 }
 
-button, input, textarea { font: inherit; color: inherit; }
+button, input, select, textarea { font: inherit; color: inherit; }
 
 button { cursor: pointer; }
 
@@ -371,7 +371,7 @@ label {
   color: var(--muted);
 }
 
-input, textarea {
+input, select, textarea {
   width: 100%;
   padding: 10px 12px;
   border-radius: 12px;
@@ -464,3 +464,48 @@ textarea {
 .log-time { color: var(--muted); }
 
 .log-row.warn .log-text { color: var(--danger); }
+
+.source-hint, .backup-info strong, .checksum p { overflow-wrap: anywhere; }
+.dialog .field-hint { margin: 6px 0 14px; font-size: 13px; }
+.backup-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.backup-list { list-style: none; padding: 0; margin: 12px 0; }
+.backup-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 0; border-top: 1px solid var(--line); }
+.backup-info { flex: 1; min-width: 0; display: grid; gap: 4px; }
+.backup-info strong { font-family: var(--mono); font-size: 12px; font-weight: 500; }
+.backup-info span { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.backup-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.restore-notice { color: var(--ok); font-size: 13px; }
+.comparison-dialog { width: min(1100px, 100%); }
+.comparison-dialog > p { overflow-wrap: anywhere; }
+.comparison { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+.comparison.single { grid-template-columns: minmax(0, 1fr); }
+.comparison h4 { margin: 16px 0 8px; font-size: 13px; font-weight: 600; }
+.code-preview { margin: 0; max-height: 50dvh; overflow: auto; border: 1px solid var(--line); background: var(--bg); padding: 8px 0; font: 12px/1.6 var(--mono); tab-size: 4; }
+.code-line { display: block; min-width: fit-content; padding-right: 12px; }
+.code-line.changed { background: var(--soft); text-decoration: underline; text-decoration-color: var(--copper); text-underline-offset: 3px; }
+.line-number { display: inline-block; width: 5ch; margin-right: 12px; padding-left: 8px; color: var(--muted); user-select: none; font-variant-numeric: tabular-nums; }
+.checksum { font-size: 12px; color: var(--muted); }
+.checksum summary { cursor: pointer; }
+.checksum p { margin: 8px 0; font-family: var(--mono); }
+.comparison-dialog .dialog-actions { flex-wrap: wrap; }
+
+@media (max-width: 760px) {
+  .shell { min-width: 0; height: auto; min-height: 100%; }
+  .top { flex-wrap: wrap; padding: 16px; }
+  .brand { flex: 1; min-width: 0; }
+  .brand p { max-width: 28ch; }
+  .top-actions { width: 100%; justify-content: flex-end; }
+  .workspace { flex-direction: column; padding: 0 12px 12px; }
+  aside { width: 100%; }
+  .shares { max-height: 180px; }
+  .aside-f { flex-direction: row; flex-wrap: wrap; }
+  .aside-f .btn { width: auto; }
+  .version { flex-basis: 100%; }
+  main { min-width: 0; padding: 24px 20px; }
+  .peer { flex-wrap: wrap; }
+  .peer .meta { overflow-wrap: anywhere; }
+  .backdrop { padding: 12px; }
+  .dialog { max-height: calc(100dvh - 24px); padding: 20px; }
+  .comparison { grid-template-columns: minmax(0, 1fr); }
+  .dialog-actions { flex-wrap: wrap; }
+}

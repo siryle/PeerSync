@@ -12,9 +12,9 @@ import (
 	"github.com/netcraft/peersync/internal/vclock"
 )
 
-func testEngine(t *testing.T, self string) *Engine {
+func testEngine(t *testing.T, self string, options ...Options) *Engine {
 	t.Helper()
-	e, err := Open(t.TempDir(), filepath.Join(t.TempDir(), "index.json"), self, nil)
+	e, err := Open(t.TempDir(), filepath.Join(t.TempDir(), "index.json"), self, nil, options...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,11 @@ func TestConflictBackupIsReused(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(e.idx.Files) != 2 {
-		t.Fatalf("repeated backup produced %d entries", len(e.idx.Files))
+	if len(e.idx.Files) != 1 {
+		t.Fatalf("backup entered the sync index: %d entries", len(e.idx.Files))
+	}
+	items, err := ListConflicts(e.IndexPath)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("repeated backup produced %v, %v", items, err)
 	}
 }

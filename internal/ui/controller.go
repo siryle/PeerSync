@@ -17,6 +17,7 @@ import (
 	"github.com/netcraft/peersync/internal/identity"
 	"github.com/netcraft/peersync/internal/invite"
 	"github.com/netcraft/peersync/internal/node"
+	"github.com/netcraft/peersync/internal/syncer"
 	"github.com/netcraft/peersync/internal/version"
 )
 
@@ -109,6 +110,8 @@ type ShareView struct {
 	Files     int               `json:"files"`
 	Discovery bool              `json:"discovery"`
 	Peers     []node.PeerStatus `json:"peers"`
+	Mode      config.SyncMode   `json:"mode"`
+	SourceID  string            `json:"source_device_id,omitempty"`
 }
 
 // State returns the current device, folders, and live peers.
@@ -136,10 +139,12 @@ func (c *Controller) State() State {
 	}
 	for _, sh := range cfg.Shares {
 		st.Shares = append(st.Shares, ShareView{
-			Label:   sh.Label,
-			Path:    sh.Path,
-			ShareID: sh.ShareID,
-			Peers:   []node.PeerStatus{},
+			Label:    sh.Label,
+			Path:     sh.Path,
+			ShareID:  sh.ShareID,
+			Peers:    []node.PeerStatus{},
+			Mode:     sh.Mode.Effective(),
+			SourceID: sh.SourceID,
 		})
 	}
 	if !running {
@@ -272,7 +277,11 @@ func (c *Controller) UpdateSettings(name, server string, port int) error {
 }
 
 // CreateShare makes a folder and returns the invite. The invite is the secret.
-func (c *Controller) CreateShare(path, label string) (inviteCode, id, name, abs string, err error) {
+func (c *Controller) CreateShare(path, label string, options ...syncer.Options) (inviteCode, id, name, abs string, err error) {
+	opt, err := c.syncOptions(options)
+	if err != nil {
+		return "", "", "", "", err
+	}
 	abs, err = cleanDir(path)
 	if err != nil {
 		return "", "", "", "", err
@@ -296,11 +305,15 @@ func (c *Controller) CreateShare(path, label string) (inviteCode, id, name, abs 
 			return err
 		}
 		id = invite.IDHex(material.ShareID)
+		if err := syncer.CheckConflictLocation(abs, config.IndexPath(c.home, id)); err != nil {
+			return err
+		}
 		cfg.Shares = append(cfg.Shares, config.Share{
 			Label:    label,
 			Path:     abs,
 			ShareID:  id,
 			ShareKey: invite.KeyString(material.ShareKey),
+			Mode:     opt.Mode, SourceID: opt.SourceID,
 		})
 		return nil
 	})
@@ -311,7 +324,11 @@ func (c *Controller) CreateShare(path, label string) (inviteCode, id, name, abs 
 }
 
 // JoinShare adds a folder from an invite code.
-func (c *Controller) JoinShare(code, path, label string) (id, abs, server string, err error) {
+func (c *Controller) JoinShare(code, path, label string, options ...syncer.Options) (id, abs, server string, err error) {
+	opt, err := c.syncOptions(options)
+	if err != nil {
+		return "", "", "", err
+	}
 	material, err := invite.Decode(code)
 	if err != nil {
 		return "", "", "", errors.New("邀请码无效")
@@ -325,6 +342,9 @@ func (c *Controller) JoinShare(code, path, label string) (id, abs, server string
 		return "", "", "", err
 	}
 	id = invite.IDHex(material.ShareID)
+	if err := syncer.CheckConflictLocation(abs, config.IndexPath(c.home, id)); err != nil {
+		return "", "", "", err
+	}
 	err = c.mutate(func(cfg *config.Config) error {
 		for _, sh := range cfg.Shares {
 			if sh.ShareID == id {
@@ -348,6 +368,7 @@ func (c *Controller) JoinShare(code, path, label string) (id, abs, server string
 			Path:     abs,
 			ShareID:  id,
 			ShareKey: invite.KeyString(material.ShareKey),
+			Mode:     opt.Mode, SourceID: opt.SourceID,
 		})
 		return nil
 	})
@@ -355,6 +376,42 @@ func (c *Controller) JoinShare(code, path, label string) (id, abs, server string
 		return "", "", "", err
 	}
 	return id, abs, server, nil
+}
+
+func (c *Controller) syncOptions(options []syncer.Options) (syncer.Options, error) {
+	var opt syncer.Options
+	if len(options) > 0 {
+		opt = options[0]
+	}
+	opt.Mode = opt.Mode.Effective()
+	opt.SourceID = strings.TrimSpace(opt.SourceID)
+	if err := config.ValidateSync(opt.Mode, opt.SourceID); err != nil {
+		return opt, errors.New("请选择有效的同步模式；仅接收模式需要来源设备 ID")
+	}
+	if opt.Mode == config.ReceiveOnly {
+		if _, err := identity.ParseDeviceID(opt.SourceID); err != nil || opt.SourceID == c.deviceID {
+			return opt, errors.New("请填写另一台设备的有效设备 ID")
+		}
+	} else {
+		opt.SourceID = ""
+	}
+	return opt, nil
+}
+
+func (c *Controller) UpdateShare(shareID string, mode config.SyncMode, sourceID string) error {
+	opt, err := c.syncOptions([]syncer.Options{{Mode: mode, SourceID: sourceID}})
+	if err != nil {
+		return err
+	}
+	return c.mutate(func(cfg *config.Config) error {
+		for i := range cfg.Shares {
+			if cfg.Shares[i].ShareID == shareID {
+				cfg.Shares[i].Mode, cfg.Shares[i].SourceID = opt.Mode, opt.SourceID
+				return nil
+			}
+		}
+		return errors.New("找不到这个文件夹")
+	})
 }
 
 // Invite rebuilds the secret code for a folder already on this device.

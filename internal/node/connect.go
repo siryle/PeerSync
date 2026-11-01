@@ -311,7 +311,7 @@ func (n *Node) finish(ctx context.Context, stream frame.Stream, cs tls.Connectio
 	n.addEvent(shareID, "info", "已连接 "+label)
 	err := syncer.Serve(sctx, sh.engine, fc, n.log.With("peer", remote.DeviceID), func(note syncer.Note) {
 		n.recordSync(shareID, label, note)
-	})
+	}, remote.DeviceID)
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 		n.log.Info("disconnected", "peer", remote.DeviceID, "err", err)
 		n.addEvent(shareID, "warn", "已断开 "+label)

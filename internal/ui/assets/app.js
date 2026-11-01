@@ -4,6 +4,8 @@ let lastKey = "";
 let modalOpen = false;
 let uiToken = "";
 let pendingDesktopAction = "";
+let modalFocusID = "";
+let backupView = { shareID: "", items: [], loading: false, error: "", notice: "" };
 
 const hashToken = (location.hash || "").replace(/^#/, "");
 if (hashToken) {
@@ -59,6 +61,10 @@ function shareHint(sh) {
   if (n > 0) return n + " 台在线";
   if (sh.discovery) return "等待其他设备";
   return "正在连接";
+}
+
+function modeLabel(mode) {
+  return ({ "send-only": "仅发送", "receive-only": "仅接收" })[mode] || "双向同步";
 }
 
 function render() {
@@ -134,16 +140,24 @@ function renderMain() {
     <div class="stats">
       <span class="chip">${sh.files} 项</span>
       <span class="chip">${esc(discovery)}</span>
+      <span class="chip">${esc(modeLabel(sh.mode))}</span>
     </div>
+    ${sh.mode === "receive-only" ? `<p class="muted source-hint">来源：${esc((peers.find((p) => p.id === sh.source_device_id) || {}).name || sh.source_device_id)}。只接收这台设备以「仅发送」模式提供的内容。</p>` : ""}
     <h3 class="section-title">其他设备</h3>
     ${peerHTML}
     <div class="actions">
       <button type="button" class="btn" id="copy-invite">复制邀请码</button>
+      <button type="button" class="btn ghost" id="share-mode">同步模式</button>
+      <button type="button" class="btn ghost" id="show-backups">冲突备份</button>
       <button type="button" class="btn danger" id="remove-share">从这台设备移除</button>
     </div>
+    <section id="backups" aria-label="冲突备份" aria-live="polite"></section>
     ${logHTML(sh)}`;
   $("copy-invite").onclick = () => showInvite(sh.share_id, sh.label);
+  $("share-mode").onclick = () => openShareMode(sh);
+  $("show-backups").onclick = () => openBackups(sh);
   $("remove-share").onclick = () => confirmRemove(sh);
+  renderBackups(sh);
   const box = $("log");
   if (box) box.scrollTop = box.scrollHeight;
 }
@@ -208,6 +222,10 @@ function showTokenGate() {
 }
 
 function openModal(title, text, body, ready) {
+  if (!modalOpen) {
+    const active = document.activeElement;
+    modalFocusID = active?.id || (active?.closest?.("#backups") ? "show-backups" : "");
+  }
   modalOpen = true;
   const root = $("modal-root");
   root.hidden = false;
@@ -225,7 +243,7 @@ function openModal(title, text, body, ready) {
     if (ev.target.dataset.close) closeModal();
   };
   ready(root);
-  const first = root.querySelector("input, textarea, button");
+  const first = root.querySelector("input, select, textarea, button");
   if (first) first.focus();
 }
 
@@ -235,6 +253,7 @@ function closeModal() {
   root.hidden = true;
   root.innerHTML = "";
   if (state) render();
+  if (modalFocusID) $(modalFocusID)?.focus();
   applyDesktopAction();
 }
 
@@ -336,14 +355,223 @@ function pathField(id) {
     <section class="folder-browser" id="folder-browser" aria-label="选择文件夹" hidden></section>`;
 }
 
+function modeFields(sh = {}) {
+  return `<label for="sync-mode">这台设备的同步模式</label>
+    <select id="sync-mode" aria-describedby="mode-hint">
+      ${["send-receive", "send-only", "receive-only"].map((mode) =>
+        `<option value="${mode}"${(sh.mode || "send-receive") === mode ? " selected" : ""}>${modeLabel(mode)}</option>`).join("")}
+    </select>
+    <p class="field-hint" id="mode-hint"></p>
+    <div id="source-row" hidden>
+      <label for="source-id">来源设备 ID</label>
+      <input id="source-id" list="source-devices" spellcheck="false" value="${esc(sh.source_device_id || "")}" placeholder="PS…">
+      <datalist id="source-devices">${(sh.peers || []).map((p) =>
+        `<option value="${esc(p.id)}">${esc(p.name || p.id)}</option>`).join("")}</datalist>
+      <p class="field-hint">从已发现的设备中选择，或填写来源设备「这台设备」页面中的完整 ID。来源必须设置为「仅发送」。</p>
+    </div>`;
+}
+
+function bindModeFields(root) {
+  const select = root.querySelector("#sync-mode");
+  const source = root.querySelector("#source-id");
+  select.onchange = () => {
+    const receiving = select.value === "receive-only";
+    root.querySelector("#source-row").hidden = !receiving;
+    source.required = receiving;
+    root.querySelector("#mode-hint").textContent = ({
+      "send-receive": "两边的修改都会同步。并发修改的本地版本保存在共享目录之外。",
+      "send-only": "这台设备是内容来源，只发送本地变化，不接受其他设备的修改或删除。",
+      "receive-only": "以指定来源为准。本地新增、修改和被来源删除的文件，会先备份再移除或覆盖；本地删除会从来源恢复。",
+    })[select.value];
+  };
+  select.onchange();
+}
+
+function readModeFields(root) {
+  const mode = root.querySelector("#sync-mode").value;
+  return { mode, source_device_id: mode === "receive-only" ? root.querySelector("#source-id").value.trim() : "" };
+}
+
+function openShareMode(sh) {
+  openModal("同步模式", "设置只作用于这台设备上的「" + esc(sh.label) + "」。保存后会重新连接。", modeFields(sh), (root) => {
+    bindModeFields(root);
+    root.querySelector("#dlg-actions").innerHTML = `<button type="button" class="btn ghost" id="cancel">取消</button>
+      <button type="submit" class="btn" id="ok">保存模式</button>`;
+    root.querySelector("#cancel").onclick = closeModal;
+    root.querySelector("form").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const ok = root.querySelector("#ok");
+      setBusy(ok, true, "正在保存");
+      try {
+        await api("/api/shares/mode", { share_id: sh.share_id, ...readModeFields(root) });
+        lastKey = "";
+        closeModal();
+        await refresh();
+      } catch (err) {
+        root.querySelector("#dlg-error").textContent = err.message;
+        setBusy(ok, false, "保存模式");
+      }
+    };
+  });
+}
+
+function bytesLabel(size) {
+  return size < 1024 ? size + " B" : size < 1048576 ? (size / 1024).toFixed(1) + " KiB" : (size / 1048576).toFixed(1) + " MiB";
+}
+
+async function openBackups(sh) {
+  backupView = { shareID: sh.share_id, items: [], loading: true, error: "", notice: "" };
+  renderBackups(sh);
+  const current = backupView;
+  try {
+    const items = await api("/api/conflicts?share_id=" + encodeURIComponent(sh.share_id));
+    if (backupView !== current) return;
+    current.items = items;
+  } catch (err) {
+    current.error = err.message;
+  } finally {
+    current.loading = false;
+    if (backupView === current && selected === sh.share_id) renderBackups(sh);
+  }
+}
+
+function renderBackups(sh) {
+  const box = $("backups");
+  if (!box || selected !== sh.share_id || backupView.shareID !== sh.share_id) return;
+  const { items, loading, error, notice } = backupView;
+  box.innerHTML = `<div class="backup-heading"><h3 class="section-title">冲突备份</h3>
+      <button type="button" class="btn ghost tiny" id="refresh-backups"${loading ? " disabled" : ""}>刷新备份</button></div>
+    <p class="muted">备份保存在这台设备的配置目录中，不参与文件同步。</p>
+    ${notice ? `<p class="restore-notice" role="status">${esc(notice)}</p>` : ""}
+    ${loading ? '<p class="muted">正在读取备份…</p>' : error ? `<p class="form-error" role="alert">${esc(error)}</p>` :
+      !items.length ? '<p class="muted">还没有冲突备份。</p>' :
+        `<ul class="backup-list">${items.map((item) => `<li>
+          <div class="backup-info"><strong>${esc(item.path)}</strong>
+            <span>${esc(new Date(item.created_at).toLocaleString())} · ${bytesLabel(item.size)}</span></div>
+          <div class="backup-actions"><button type="button" class="btn ghost tiny" data-view="${esc(item.id)}">查看</button>
+            <button type="button" class="btn ghost tiny" data-compare="${esc(item.id)}">比较与恢复</button></div>
+        </li>`).join("")}</ul>`}`;
+  $("refresh-backups").onclick = () => openBackups(sh);
+  box.querySelectorAll("[data-view]").forEach((btn) => { btn.onclick = () => openConflict(sh, btn.dataset.view, false); });
+  box.querySelectorAll("[data-compare]").forEach((btn) => { btn.onclick = () => openConflict(sh, btn.dataset.compare, true); });
+}
+
+function codeLines(text, other) {
+  const all = text.split("\n");
+  const lines = all.slice(0, 4000);
+  const compare = other === undefined ? null : other.split("\n");
+  let prefix = 0, suffix = 0;
+  if (compare) {
+    while (prefix < all.length && prefix < compare.length && all[prefix] === compare[prefix]) prefix++;
+    while (suffix < all.length - prefix && suffix < compare.length - prefix &&
+      all[all.length - suffix - 1] === compare[compare.length - suffix - 1]) suffix++;
+  }
+  return lines.map((line, i) => `<span class="code-line${compare && i >= prefix && i < all.length - suffix ? " changed" : ""}"><span class="line-number" aria-hidden="true">${i + 1}</span>${esc(line) || " "}</span>`).join("") +
+    (all.length > 4000 ? '<span class="code-line">仅预览前 4000 行，请下载完整文件。</span>' : "");
+}
+
+async function openConflict(sh, id, compare) {
+  let loading;
+  openModal(compare ? "比较备份" : "查看备份", "正在读取文件…", '<div id="conflict-loading"></div>', (root) => {
+    loading = root.querySelector("#conflict-loading");
+    root.querySelector("#dlg-actions").innerHTML = '<button type="button" class="btn ghost" id="cancel">关闭</button>';
+    root.querySelector("#cancel").onclick = closeModal;
+  });
+  try {
+    const item = await api("/api/conflicts/" + encodeURIComponent(id) + "?share_id=" + encodeURIComponent(sh.share_id));
+    if (!loading.isConnected) return;
+    showConflict(sh, item, compare);
+  } catch (err) {
+    if (loading.isConnected) $("dlg-error").textContent = err.message;
+  }
+}
+
+function showConflict(sh, item, compare) {
+  const equal = item.current_exists && item.current_sum === item.sum;
+  const content = item.text_available
+    ? `<div class="comparison${compare ? "" : " single"}">
+        <section><h4>备份版本</h4><pre class="code-preview" tabindex="0" aria-label="备份内容"><code>${codeLines(item.backup_text, compare ? item.current_text : undefined)}</code></pre></section>
+        ${compare ? `<section><h4>当前文件${item.current_is_dir ? "（当前为文件夹）" : item.current_exists ? "" : "（已不存在）"}</h4><pre class="code-preview" tabindex="0" aria-label="当前文件内容"><code>${codeLines(item.current_text, item.backup_text)}</code></pre></section>` : ""}
+      </div>`
+    : '<p class="muted">二进制文件或大于 512 KiB 的内容不提供文本预览。可通过大小和校验值比较，并下载备份。</p>';
+  openModal(compare ? "比较备份" : "查看备份", esc(item.path),
+    `<p class="muted">备份于 ${esc(new Date(item.created_at).toLocaleString())} · ${bytesLabel(item.size)}。${item.current_is_dir ? "当前路径是文件夹，请下载备份到其他位置；恢复前需要先移走该文件夹。" : !item.current_exists ? "当前文件已不存在。" : equal ? "两份文件内容相同。" : "两份文件内容不同。"}</p>
+      <details class="checksum"><summary>文件校验值与大小</summary><p>备份：${bytesLabel(item.size)} · ${esc(item.sum)}</p>
+        <p>当前：${item.current_is_dir ? "文件夹" : item.current_exists ? bytesLabel(item.current_size) + " · " + esc(item.current_sum) : "文件不存在"}</p></details>
+      ${content}`, (root) => {
+      root.querySelector(".dialog").classList.add("comparison-dialog");
+      root.querySelector("#dlg-actions").innerHTML = `<button type="button" class="btn ghost" id="cancel">关闭</button>
+        <button type="button" class="btn ghost" id="download-backup">下载备份</button>
+        <button type="button" class="btn ghost" id="toggle-compare">${compare ? "只看备份" : "与当前文件比较"}</button>
+        <button type="button" class="btn" id="restore-backup"${item.current_is_dir ? " disabled" : ""}>恢复这个版本</button>`;
+      root.querySelector("#cancel").onclick = closeModal;
+      root.querySelector("#toggle-compare").onclick = () => showConflict(sh, item, !compare);
+      root.querySelector("#download-backup").onclick = () => downloadBackup(sh, item);
+      root.querySelector("#restore-backup").onclick = () => confirmRestore(sh, item);
+    });
+}
+
+async function downloadBackup(sh, item) {
+  const btn = $("download-backup");
+  setBusy(btn, true, "正在下载");
+  try {
+    const headers = { "X-PeerSync": "1" };
+    if (uiToken) headers["X-PeerSync-Token"] = uiToken;
+    const res = await fetch("/api/conflicts/" + encodeURIComponent(item.id) + "/download?share_id=" + encodeURIComponent(sh.share_id), { headers });
+    if (!res.ok) throw new Error("下载失败，请刷新备份后重试");
+    const url = URL.createObjectURL(await res.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = item.path.split("/").pop();
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } catch (err) {
+    const error = $("dlg-error");
+    if (error) error.textContent = err.message;
+  } finally {
+    setBusy(btn, false, "下载备份");
+  }
+}
+
+function confirmRestore(sh, item) {
+  openModal("恢复备份并暂停同步",
+    "将恢复「" + esc(item.path) + "」。当前文件会先保存为另一份备份。恢复成功后，同步保持暂停，请检查文件后手动开始同步。",
+    `${sh.mode === "receive-only" ? '<p class="banner">此文件夹为仅接收模式。再次开始同步时，来源设备的版本会覆盖恢复的内容。需要保留时，请先调整同步模式或下载备份到其他位置。</p>' : ""}`,
+    (root) => {
+      root.querySelector("#dlg-actions").innerHTML = '<button type="button" class="btn ghost" id="cancel">返回比较</button><button type="submit" class="btn" id="ok">恢复并暂停同步</button>';
+      root.querySelector("#cancel").onclick = () => showConflict(sh, item, true);
+      root.querySelector("form").onsubmit = async (ev) => {
+        ev.preventDefault();
+        const ok = root.querySelector("#ok");
+        setBusy(ok, true, "正在恢复");
+        try {
+          await api("/api/conflicts/" + encodeURIComponent(item.id) + "/restore", { share_id: sh.share_id, expected_sum: item.current_sum });
+          closeModal();
+          lastKey = "";
+          await refresh();
+          await openBackups(sh);
+          backupView.notice = "已恢复 " + item.path + "，同步已暂停。检查后可手动开始同步。";
+          renderBackups(sh);
+        } catch (err) {
+          root.querySelector("#dlg-error").textContent = err.message;
+          setBusy(ok, false, "恢复并暂停同步");
+        }
+      };
+    });
+}
+
 function openCreate() {
   openModal(
     "新建文件夹",
     "这台电脑上的这个目录会和加入同一邀请码的设备对齐。",
     `<label for="label">名称</label>
      <input id="label" name="label" maxlength="40" placeholder="例如 文档">
-     ${pathField("path")}`,
+     ${pathField("path")}
+     ${modeFields()}`,
     (root) => {
+      bindModeFields(root);
       root.querySelector("#pick").onclick = () => chooseFolder(root.querySelector("#path"));
       const actions = root.querySelector("#dlg-actions");
       actions.innerHTML = `<button type="button" class="btn ghost" id="cancel">取消</button>
@@ -357,6 +585,7 @@ function openCreate() {
           const res = await api("/api/shares", {
             label: root.querySelector("#label").value,
             path: root.querySelector("#path").value,
+            ...readModeFields(root),
           });
           selected = res.share_id;
           lastKey = "";
@@ -380,8 +609,10 @@ function openJoin() {
      <textarea id="invite" spellcheck="false" placeholder="peersync1_..."></textarea>
      <label for="label">名称</label>
      <input id="label" maxlength="40" placeholder="可留空，用文件夹名">
-     ${pathField("path")}`,
+     ${pathField("path")}
+     ${modeFields()}`,
     (root) => {
+      bindModeFields(root);
       root.querySelector("#pick").onclick = () => chooseFolder(root.querySelector("#path"));
       const actions = root.querySelector("#dlg-actions");
       actions.innerHTML = `<button type="button" class="btn ghost" id="cancel">取消</button>
@@ -396,6 +627,7 @@ function openJoin() {
             invite: root.querySelector("#invite").value,
             label: root.querySelector("#label").value,
             path: root.querySelector("#path").value,
+            ...readModeFields(root),
           });
           selected = res.share_id;
           lastKey = "";
@@ -596,6 +828,13 @@ $("power").onclick = async () => {
 };
 
 document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Tab" && modalOpen) {
+    const controls = [...$("modal-root").querySelectorAll("button, input, select, textarea, [tabindex='0']")]
+      .filter((el) => !el.disabled && el.getClientRects().length);
+    const first = controls[0], last = controls[controls.length - 1];
+    if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last?.focus(); }
+    else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first?.focus(); }
+  }
   if (ev.key !== "Escape" || !modalOpen) return;
   const browser = $("folder-browser");
   if (browser && !browser.hidden) {

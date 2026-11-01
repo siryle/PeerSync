@@ -25,6 +25,7 @@ type Task struct {
 	Seen     vclock.Vector
 	Had      bool
 	Metadata bool // Apply the remote attributes along with the merged version.
+	Backup   bool // Preserve a receive-only local edit before replacing it.
 	Remote   proto.Entry
 }
 
@@ -153,4 +154,58 @@ func sameSum(local [32]byte, remoteHex string) bool {
 		return false
 	}
 	return bytes.Equal(local[:], raw[:])
+}
+
+func planReceive(local map[string]*File, remote []proto.Entry) []Task {
+	seen := make(map[string]bool, len(remote))
+	var tasks []Task
+	for _, r := range remote {
+		if !ValidRel(r.Path) {
+			continue
+		}
+		seen[r.Path] = true
+		cur := local[r.Path]
+		base := Task{Path: r.Path, Remote: r, Version: vclock.Clone(r.Version)}
+		if cur != nil {
+			base.Had = true
+			base.Seen = vclock.Clone(cur.Version)
+			base.Backup = !cur.Deleted && !cur.IsDir && (cur.Local || vclock.Compare(cur.Version, r.Version) != -1)
+		}
+		switch {
+		case r.Deleted:
+			if cur == nil || cur.Deleted {
+				continue
+			}
+			base.Op = opDelete
+		case cur == nil || cur.Deleted || cur.IsDir != r.IsDir:
+			base = remoteWins(base, r)
+		case r.IsDir || sameSum(cur.Sum, r.Sum):
+			if cur.Mode == r.Mode && (r.IsDir || cur.ModTime == r.ModTime) && !cur.Local && vclock.Compare(cur.Version, r.Version) == 0 {
+				continue
+			}
+			base.Op, base.Metadata = opMerge, true
+			base.Backup = false
+		default:
+			base.Op = opPull
+		}
+		tasks = append(tasks, base)
+	}
+	for p, cur := range local {
+		if seen[p] || cur.Deleted {
+			continue
+		}
+		tasks = append(tasks, Task{
+			Op: opDelete, Path: p, Had: true, Seen: vclock.Clone(cur.Version),
+			Version: vclock.Clone(cur.Version), Backup: !cur.IsDir,
+			Remote: proto.Entry{Path: p, Deleted: true, IsDir: cur.IsDir},
+		})
+	}
+	sort.SliceStable(tasks, func(i, j int) bool {
+		a, b := tasks[i], tasks[j]
+		if (a.Op == opDelete) != (b.Op == opDelete) {
+			return a.Op == opDelete
+		}
+		return a.Op == opDelete && strings.Count(a.Path, "/") > strings.Count(b.Path, "/")
+	})
+	return tasks
 }

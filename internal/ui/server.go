@@ -6,9 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"path/filepath"
 	"time"
+
+	"github.com/netcraft/peersync/internal/config"
+	"github.com/netcraft/peersync/internal/syncer"
 )
 
 // Serve listens on 127.0.0.1 and returns the page URL. It stops when ctx is done.
@@ -136,14 +141,16 @@ func handler(c *Controller, token string) http.Handler {
 	}))
 	mux.HandleFunc("POST /api/shares", apiWith(token, func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Path  string `json:"path"`
-			Label string `json:"label"`
+			Path     string          `json:"path"`
+			Label    string          `json:"label"`
+			Mode     config.SyncMode `json:"mode"`
+			SourceID string          `json:"source_device_id"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			writeErr(w, err)
 			return
 		}
-		code, id, label, abs, err := c.CreateShare(body.Path, body.Label)
+		code, id, label, abs, err := c.CreateShare(body.Path, body.Label, syncer.Options{Mode: body.Mode, SourceID: body.SourceID})
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -157,15 +164,17 @@ func handler(c *Controller, token string) http.Handler {
 	}))
 	mux.HandleFunc("POST /api/shares/join", apiWith(token, func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Invite string `json:"invite"`
-			Path   string `json:"path"`
-			Label  string `json:"label"`
+			Invite   string          `json:"invite"`
+			Path     string          `json:"path"`
+			Label    string          `json:"label"`
+			Mode     config.SyncMode `json:"mode"`
+			SourceID string          `json:"source_device_id"`
 		}
 		if err := readJSON(r, &body); err != nil {
 			writeErr(w, err)
 			return
 		}
-		id, abs, server, err := c.JoinShare(body.Invite, body.Path, body.Label)
+		id, abs, server, err := c.JoinShare(body.Invite, body.Path, body.Label, syncer.Options{Mode: body.Mode, SourceID: body.SourceID})
 		if err != nil {
 			writeErr(w, err)
 			return
@@ -205,11 +214,71 @@ func handler(c *Controller, token string) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, c.State())
 	}))
+	mux.HandleFunc("POST /api/shares/mode", apiWith(token, func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ShareID  string          `json:"share_id"`
+			Mode     config.SyncMode `json:"mode"`
+			SourceID string          `json:"source_device_id"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		if err := c.UpdateShare(body.ShareID, body.Mode, body.SourceID); err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, c.State())
+	}))
+	mux.HandleFunc("GET /api/conflicts", apiWith(token, func(w http.ResponseWriter, r *http.Request) {
+		items, err := c.Conflicts(r.URL.Query().Get("share_id"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	}))
+	mux.HandleFunc("GET /api/conflicts/{id}", apiWith(token, func(w http.ResponseWriter, r *http.Request) {
+		item, err := c.Conflict(r.URL.Query().Get("share_id"), r.PathValue("id"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, item)
+	}))
+	mux.HandleFunc("GET /api/conflicts/{id}/download", apiWith(token, func(w http.ResponseWriter, r *http.Request) {
+		item, f, err := c.DownloadConflict(r.URL.Query().Get("share_id"), r.PathValue("id"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		defer f.Close()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filepath.Base(item.Path)}))
+		http.ServeContent(w, r, item.Path, item.CreatedAt, f)
+	}))
+	mux.HandleFunc("POST /api/conflicts/{id}/restore", apiWith(token, func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ShareID  string `json:"share_id"`
+			Expected string `json:"expected_sum"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, err)
+			return
+		}
+		if err := c.RestoreConflict(body.ShareID, r.PathValue("id"), body.Expected); err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, c.State())
+	}))
 	return mux
 }
 
 func apiWith(token string, fn http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		if token != "" {
 			if !tokenMatch(r.Header.Get("X-PeerSync-Token"), token) {
 				http.Error(w, "forbidden", http.StatusUnauthorized)

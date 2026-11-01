@@ -6,7 +6,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,8 +20,8 @@ func connectEngines(t *testing.T, a, b *Engine, note func(Note)) func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	left, right := net.Pipe()
 	stopped := make(chan error, 2)
-	go func() { stopped <- Serve(ctx, a, frame.New(left), nil, nil) }()
-	go func() { stopped <- Serve(ctx, b, frame.New(right), nil, note) }()
+	go func() { stopped <- Serve(ctx, a, frame.New(left), nil, nil, b.Self) }()
+	go func() { stopped <- Serve(ctx, b, frame.New(right), nil, note, a.Self) }()
 	var once sync.Once
 	stop := func() {
 		once.Do(func() {
@@ -60,39 +59,30 @@ func TestConcurrentEditsConverge(t *testing.T) {
 	for _, e := range []*Engine{a, b} {
 		waitBytes(t, filepath.Join(e.Root, "a.txt"), []byte(winner))
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		complete := true
-		for _, e := range []*Engine{a, b} {
-			_, entries := e.Entries()
-			if len(entries) != 2 {
-				complete = false
-				continue
-			}
-			for _, entry := range entries {
-				if entry.Path == "a.txt" {
-					if vclock.Compare(entry.Version, vclock.Vector{"A": 1, "B": 1}) != 0 {
-						complete = false
-					}
-				} else {
-					if !strings.Contains(entry.Path, ".sync-conflict-") {
-						t.Fatalf("unexpected path %q", entry.Path)
-					}
-					body, err := os.ReadFile(filepath.Join(e.Root, entry.Path))
-					if err != nil || string(body) != loser {
-						complete = false
-					}
-				}
+	waitIndexes(t, 1, a, b)
+	backups := 0
+	for _, e := range []*Engine{a, b} {
+		items, err := ListConflicts(e.IndexPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range items {
+			backups++
+			waitBytes(t, filepath.Join(ConflictDir(e.IndexPath), item.ID+".data"), []byte(loser))
+		}
+		files, err := os.ReadDir(e.Root)
+		if err != nil {
+			t.Fatalf("backup leaked into share: %v, %v", files, err)
+		}
+		for _, f := range files {
+			if f.Name() != "a.txt" && f.Name() != tmpDirName {
+				t.Fatalf("backup leaked into share: %s", f.Name())
 			}
 		}
-		if complete {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
 	}
-	_, ae := a.Entries()
-	_, be := b.Entries()
-	t.Fatalf("conflict did not converge: A=%+v B=%+v", ae, be)
+	if backups != 1 {
+		t.Fatalf("got %d external backups, want 1", backups)
+	}
 }
 
 func TestDownloadRetriesAfterTemporaryFailure(t *testing.T) {
@@ -124,11 +114,9 @@ func TestDownloadRetriesAfterTemporaryFailure(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("first download never attempted")
 	}
-	_, entries := b.Entries()
-	for _, entry := range entries {
-		if strings.Contains(entry.Path, ".sync-conflict-") {
-			t.Fatal("failed download created a conflict backup")
-		}
+	items, err := ListConflicts(b.IndexPath)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("failed download created a backup: %v, %v", items, err)
 	}
 	if err := os.Remove(filepath.Join(b.Root, tmpDirName)); err != nil {
 		t.Fatal(err)

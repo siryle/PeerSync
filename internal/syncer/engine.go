@@ -13,13 +13,13 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 
+	"github.com/netcraft/peersync/internal/config"
 	"github.com/netcraft/peersync/internal/ignore"
 	"github.com/netcraft/peersync/internal/proto"
 	"github.com/netcraft/peersync/internal/vclock"
@@ -38,6 +38,7 @@ type File struct {
 	Sum     [32]byte      `json:"sum,omitempty"`
 	Blocks  [][32]byte    `json:"blocks,omitempty"`
 	Version vclock.Vector `json:"version"`
+	Local   bool          `json:"local,omitempty"`
 }
 
 type indexFile struct {
@@ -52,6 +53,8 @@ type Engine struct {
 	Self      string
 	Log       *slog.Logger
 	root      *os.Root
+	Mode      config.SyncMode
+	SourceID  string
 
 	mu       sync.Mutex
 	idx      indexFile
@@ -67,15 +70,30 @@ type Engine struct {
 	readyOnce sync.Once
 }
 
+type Options struct {
+	Mode     config.SyncMode
+	SourceID string
+}
+
 // Open loads an index. A missing or corrupt index starts empty; the next
 // scan treats every file as a local edit, which converges with identical
 // copies instead of deleting them.
-func Open(root, indexPath, self string, log *slog.Logger) (*Engine, error) {
+func Open(root, indexPath, self string, log *slog.Logger, options ...Options) (*Engine, error) {
 	if log == nil {
 		log = slog.Default()
 	}
 	abs, err := filepath.Abs(root)
 	if err != nil {
+		return nil, err
+	}
+	var opt Options
+	if len(options) > 0 {
+		opt = options[0]
+	}
+	if err := config.ValidateSync(opt.Mode, opt.SourceID); err != nil {
+		return nil, err
+	}
+	if err := CheckConflictLocation(abs, indexPath); err != nil {
 		return nil, err
 	}
 	dir, err := os.OpenRoot(abs)
@@ -92,6 +110,8 @@ func Open(root, indexPath, self string, log *slog.Logger) (*Engine, error) {
 		kick:      make(chan struct{}, 1),
 		idx:       indexFile{Files: map[string]*File{}},
 		ready:     make(chan struct{}),
+		Mode:      opt.Mode.Effective(),
+		SourceID:  opt.SourceID,
 	}
 	if err := e.load(); err != nil {
 		e.Log.Warn("index unreadable, scanning as a new folder", "err", err, "path", indexPath)
@@ -401,6 +421,7 @@ func (e *Engine) scan(full bool) error {
 		if prev != nil && !prev.Deleted && prev.Mode != it.mode {
 			prev.Mode = it.mode
 			prev.Version = vclock.Bump(prev.Version, e.Self)
+			prev.Local = e.Mode == config.ReceiveOnly
 			changed = true
 		}
 	}
@@ -418,6 +439,7 @@ func (e *Engine) scan(full bool) error {
 		f.Sum = [32]byte{}
 		f.Size = 0
 		f.Version = vclock.Bump(f.Version, e.Self)
+		f.Local = e.Mode == config.ReceiveOnly
 		changed = true
 	}
 	if changed {
@@ -465,13 +487,14 @@ func (e *Engine) upsertDir(rel string, mode uint32) bool {
 		}
 		prev.Mode = mode
 		prev.Version = vclock.Bump(prev.Version, e.Self)
+		prev.Local = e.Mode == config.ReceiveOnly
 		return true
 	}
 	ver := vclock.Vector{}
 	if prev != nil {
 		ver = prev.Version
 	}
-	e.idx.Files[rel] = &File{IsDir: true, Mode: mode, Version: vclock.Bump(ver, e.Self)}
+	e.idx.Files[rel] = &File{IsDir: true, Mode: mode, Version: vclock.Bump(ver, e.Self), Local: e.Mode == config.ReceiveOnly}
 	return true
 }
 
@@ -491,6 +514,7 @@ func (e *Engine) upsertFile(rel string, size, mtime int64, mode uint32, sum [32]
 	e.idx.Files[rel] = &File{
 		Size: size, ModTime: mtime, Mode: mode,
 		Sum: sum, Blocks: blocks, Version: vclock.Bump(ver, e.Self),
+		Local: e.Mode == config.ReceiveOnly,
 	}
 	return true
 }
@@ -517,6 +541,9 @@ func (e *Engine) Entries() (uint64, []proto.Entry) {
 
 // Plan builds work items for a remote index.
 func (e *Engine) Plan(remote []proto.Entry) []Task {
+	if e.Mode == config.SendOnly {
+		return nil
+	}
 	ig := e.ignores()
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -529,16 +556,25 @@ func (e *Engine) Plan(remote []proto.Entry) []Task {
 	}
 	local := make(map[string]*File, len(e.idx.Files))
 	for k, v := range e.idx.Files {
+		if ig.Match(k, v.IsDir) {
+			continue
+		}
 		cp := *v
 		cp.Version = vclock.Clone(v.Version)
 		cp.Blocks = nil
 		local[k] = &cp
+	}
+	if e.Mode == config.ReceiveOnly {
+		return planReceive(local, filtered)
 	}
 	return Plan(e.Self, local, filtered)
 }
 
 // Meta returns the block list of a non-deleted file.
 func (e *Engine) Meta(rel string) (sum [32]byte, blocks [][32]byte, size int64, err error) {
+	if e.Mode == config.ReceiveOnly {
+		return sum, nil, 0, errors.New("receive-only folder does not serve files")
+	}
 	if !ValidRel(rel) {
 		return sum, nil, 0, errors.New("bad path")
 	}
@@ -606,6 +642,14 @@ func (e *Engine) ApplyDelete(task Task) error {
 	if err := e.checkLocalLocked(task); err != nil {
 		return err
 	}
+	if task.Backup {
+		if err := e.stageConflictLocked(task); err != nil {
+			return err
+		}
+		if err := e.checkLocalLocked(task); err != nil {
+			return err
+		}
+	}
 	if err := e.root.Remove(task.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -636,6 +680,7 @@ func (e *Engine) ApplyMerge(task Task) error {
 		}
 	}
 	cur.Version = vclock.Clone(task.Version)
+	cur.Local = false
 	e.idx.Seq++
 	return e.persistLocked()
 }
@@ -649,6 +694,9 @@ func (e *Engine) ApplyDir(task Task) error {
 	}
 	if cur := e.idx.Files[task.Path]; cur != nil && !cur.Deleted && !cur.IsDir {
 		if err := e.stageConflictLocked(task); err != nil {
+			return err
+		}
+		if err := e.checkLocalLocked(task); err != nil {
 			return err
 		}
 		if err := e.root.Remove(task.Path); err != nil {
@@ -665,76 +713,6 @@ func (e *Engine) ApplyDir(task Task) error {
 	e.idx.Files[task.Path] = &File{IsDir: true, Mode: uint32(info.Mode().Perm()), Version: vclock.Clone(task.Version)}
 	e.idx.Seq++
 	return e.persistLocked()
-}
-
-// stageConflictLocked saves a verified local version only when its replacement is ready.
-func (e *Engine) stageConflictLocked(task Task) error {
-	cur := e.idx.Files[task.Path]
-	if cur == nil || cur.Deleted || cur.IsDir {
-		return errStale
-	}
-	// A retry must find the same backup instead of producing another conflict.
-	base := conflictName(task.Path, cur)
-	for i := 0; i < 100; i++ {
-		name := base
-		if i > 0 {
-			ext := path.Ext(base)
-			name = strings.TrimSuffix(base, ext) + "-" + strconv.Itoa(i) + ext
-		}
-		if !ValidRel(name) {
-			return errors.New("conflict path too long")
-		}
-		out, err := e.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, fileMode(cur.Mode, false))
-		if errors.Is(err, os.ErrExist) {
-			sum, _, _, hashErr := e.hashFile(name)
-			if hashErr == nil && sum == cur.Sum {
-				return nil
-			}
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		in, err := e.openFile(task.Path)
-		if err == nil {
-			_, err = io.Copy(out, in)
-			_ = in.Close()
-		}
-		if err == nil {
-			err = out.Sync()
-		}
-		if err == nil {
-			_, err = out.Seek(0, io.SeekStart)
-		}
-		var sum [32]byte
-		var blocks [][32]byte
-		var size int64
-		if err == nil {
-			sum, blocks, size, err = HashReader(out)
-		}
-		closeErr := out.Close()
-		if err == nil {
-			err = closeErr
-		}
-		var info os.FileInfo
-		if err == nil {
-			info, err = e.setMetadata(name, proto.Entry{Mode: cur.Mode, ModTime: cur.ModTime})
-		}
-		if err == nil && (sum != cur.Sum || size != cur.Size) {
-			err = errStale
-		}
-		if err != nil {
-			_ = e.root.Remove(name)
-			return err
-		}
-		e.idx.Files[name] = &File{
-			Size: size, ModTime: info.ModTime().UnixNano(), Mode: cur.Mode,
-			Sum: sum, Blocks: blocks, Version: vclock.Bump(cur.Version, e.Self),
-		}
-		e.idx.Seq++
-		return e.persistLocked()
-	}
-	return errors.New("could not pick a conflict name")
 }
 
 // CommitDownload checks local changes before replacing any bytes on disk.
@@ -763,7 +741,7 @@ func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error 
 	if err := e.checkLocalLocked(task); err != nil {
 		return err
 	}
-	if task.Op == opConflict {
+	if task.Op == opConflict || task.Backup {
 		if err := e.stageConflictLocked(task); err != nil {
 			return err
 		}
@@ -774,6 +752,11 @@ func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error 
 	info, err := e.setMetadata(tmp, task.Remote)
 	if err != nil {
 		return err
+	}
+	if task.Op == opConflict || task.Backup {
+		if err := e.checkLocalLocked(task); err != nil {
+			return err
+		}
 	}
 	cur := e.idx.Files[task.Path]
 	replacingDir := cur != nil && !cur.Deleted && cur.IsDir
@@ -895,13 +878,4 @@ func fileMode(m uint32, dir bool) os.FileMode {
 		return 0o644
 	}
 	return perm
-}
-
-func conflictName(rel string, f *File) string {
-	ext := path.Ext(rel)
-	base := rel[:len(rel)-len(ext)]
-	// JSON sorts vector keys, so every replica names the same losing version alike.
-	version, _ := json.Marshal(f.Version)
-	digest := sha256.Sum256(append(f.Sum[:], version...))
-	return base + fmt.Sprintf(".sync-conflict-%x", digest[:16]) + ext
 }

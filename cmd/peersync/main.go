@@ -84,6 +84,7 @@ Usage:
   peersync share create --path DIR [--label name]
   peersync share join --invite CODE --path DIR [--server URL]
   peersync share ls
+  peersync share mode --mode MODE [--source DEVICE_ID] SHARE_ID
   peersync share rm SHARE_ID
 
 The discovery server only introduces devices. Directory contents move
@@ -257,6 +258,8 @@ func cmdShare(args []string) {
 		cmdShareLs(args[1:])
 	case "rm":
 		cmdShareRm(args[1:])
+	case "mode":
+		cmdShareMode(args[1:])
 	default:
 		usage()
 		os.Exit(2)
@@ -269,7 +272,12 @@ func cmdShareCreate(args []string) {
 	path := fs.String("path", "", "directory to share")
 	label := fs.String("label", "", "short name")
 	server := fs.String("server", "", "discovery server stored in the invite")
+	mode := fs.String("mode", string(config.SendReceive), "send-receive, send-only, or receive-only")
+	source := fs.String("source", "", "source device ID for receive-only")
 	_ = fs.Parse(args)
+	if err := validateShareMode(config.SyncMode(*mode), *source); err != nil {
+		fatal(err)
+	}
 	if *path == "" {
 		fatal(errors.New("--path is required"))
 	}
@@ -302,6 +310,7 @@ func cmdShareCreate(args []string) {
 		Path:     abs,
 		ShareID:  invite.IDHex(material.ShareID),
 		ShareKey: invite.KeyString(material.ShareKey),
+		Mode:     config.SyncMode(*mode), SourceID: *source,
 	})
 	if err := config.Save(filepath.Join(dir, config.FileName), cfg); err != nil {
 		fatal(err)
@@ -317,7 +326,12 @@ func cmdShareJoin(args []string) {
 	path := fs.String("path", "", "local directory")
 	label := fs.String("label", "", "short name")
 	server := fs.String("server", "", "override the discovery server in the invite")
+	mode := fs.String("mode", string(config.SendReceive), "send-receive, send-only, or receive-only")
+	source := fs.String("source", "", "source device ID for receive-only")
 	_ = fs.Parse(args)
+	if err := validateShareMode(config.SyncMode(*mode), *source); err != nil {
+		fatal(err)
+	}
 	if *code == "" || *path == "" {
 		fatal(errors.New("--invite and --path are required"))
 	}
@@ -354,6 +368,7 @@ func cmdShareJoin(args []string) {
 		Path:     abs,
 		ShareID:  id,
 		ShareKey: invite.KeyString(material.ShareKey),
+		Mode:     config.SyncMode(*mode), SourceID: *source,
 	})
 	if err := config.Save(filepath.Join(dir, config.FileName), cfg); err != nil {
 		fatal(err)
@@ -371,7 +386,7 @@ func cmdShareLs(args []string) {
 		return
 	}
 	for _, sh := range cfg.Shares {
-		fmt.Printf("%s\t%s\t%s\n", sh.ShareID, sh.Label, sh.Path)
+		fmt.Printf("%s\t%s\t%s\t%s\t%s\n", sh.ShareID, sh.Label, sh.Path, sh.Mode.Effective(), sh.SourceID)
 	}
 }
 
@@ -404,6 +419,45 @@ func cmdShareRm(args []string) {
 	fmt.Println("removed", id)
 }
 
+func validateShareMode(mode config.SyncMode, source string) error {
+	if err := config.ValidateSync(mode, source); err != nil {
+		return err
+	}
+	if mode == config.ReceiveOnly {
+		_, err := identity.ParseDeviceID(source)
+		return err
+	}
+	return nil
+}
+
+func cmdShareMode(args []string) {
+	fs := flag.NewFlagSet("share mode", flag.ExitOnError)
+	home := fs.String("home", "", "config directory")
+	mode := fs.String("mode", "", "send-receive, send-only, or receive-only")
+	source := fs.String("source", "", "source device ID for receive-only")
+	_ = fs.Parse(args)
+	if *mode == "" || fs.NArg() != 1 {
+		fatal(errors.New("usage: peersync share mode --mode MODE [--source DEVICE_ID] SHARE_ID"))
+	}
+	if err := validateShareMode(config.SyncMode(*mode), *source); err != nil {
+		fatal(err)
+	}
+	dir := mustHome(*home)
+	cfg := mustConfig(dir)
+	for i := range cfg.Shares {
+		if cfg.Shares[i].ShareID != fs.Arg(0) {
+			continue
+		}
+		cfg.Shares[i].Mode, cfg.Shares[i].SourceID = config.SyncMode(*mode), *source
+		if err := config.Save(filepath.Join(dir, config.FileName), cfg); err != nil {
+			fatal(err)
+		}
+		fmt.Println("mode saved; restart PeerSync to apply")
+		return
+	}
+	fatal(errors.New("share not found"))
+}
+
 func applyEnv(home, serverFlag string) error {
 	path := filepath.Join(home, config.FileName)
 	cfg, exists, err := config.Load(path)
@@ -419,6 +473,11 @@ func applyEnv(home, serverFlag string) error {
 		cfg.Server = env
 	}
 	syncPath := os.Getenv("PEERSYNC_PATH")
+	mode := config.SyncMode(os.Getenv("PEERSYNC_MODE")).Effective()
+	source := os.Getenv("PEERSYNC_SOURCE_DEVICE_ID")
+	if err := validateShareMode(mode, source); err != nil {
+		return err
+	}
 	if os.Getenv("PEERSYNC_CREATE") == "1" && len(cfg.Shares) == 0 {
 		if syncPath == "" {
 			syncPath = "/sync"
@@ -448,6 +507,7 @@ func applyEnv(home, serverFlag string) error {
 			Path:     abs,
 			ShareID:  invite.IDHex(material.ShareID),
 			ShareKey: invite.KeyString(material.ShareKey),
+			Mode:     mode, SourceID: source,
 		})
 		fmt.Printf("INVITE=%s\n", code)
 	}
@@ -489,6 +549,7 @@ func applyEnv(home, serverFlag string) error {
 				Path:     abs,
 				ShareID:  id,
 				ShareKey: invite.KeyString(material.ShareKey),
+				Mode:     mode, SourceID: source,
 			})
 			fmt.Printf("joined %s at %s\n", id, abs)
 		}

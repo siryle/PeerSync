@@ -17,7 +17,9 @@ func Describe(n Note) (level, text string) {
 	case opDir:
 		return "info", "新建目录 " + n.Path
 	case opConflict:
-		return "warn", "冲突，两边的修改都保留 " + n.Path
+		return "warn", "冲突，已在共享目录外备份本地版本 " + n.Path
+	case "backup":
+		return "warn", "已在共享目录外备份本地修改 " + n.Path
 	case "send":
 		return "info", "发送 " + n.Path
 	case "fail":

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // FileName is the config file inside the home directory.
@@ -26,10 +27,40 @@ type Config struct {
 
 // Share is one synchronized directory.
 type Share struct {
-	Label    string `json:"label"`
-	Path     string `json:"path"`
-	ShareID  string `json:"share_id"`
-	ShareKey string `json:"share_key"`
+	Label    string   `json:"label"`
+	Path     string   `json:"path"`
+	ShareID  string   `json:"share_id"`
+	ShareKey string   `json:"share_key"`
+	Mode     SyncMode `json:"mode,omitempty"`
+	SourceID string   `json:"source_device_id,omitempty"`
+}
+
+type SyncMode string
+
+const (
+	SendReceive SyncMode = "send-receive"
+	SendOnly    SyncMode = "send-only"
+	ReceiveOnly SyncMode = "receive-only"
+)
+
+func (m SyncMode) Effective() SyncMode {
+	if m == "" {
+		return SendReceive
+	}
+	return m
+}
+
+func ValidateSync(mode SyncMode, sourceID string) error {
+	switch mode.Effective() {
+	case SendReceive, SendOnly:
+	case ReceiveOnly:
+		if strings.TrimSpace(sourceID) == "" {
+			return errors.New("receive-only mode requires a source device ID")
+		}
+	default:
+		return errors.New("invalid sync mode")
+	}
+	return nil
 }
 
 // Home returns the configuration directory.

@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -197,17 +196,25 @@ func TestReplicatedConflictHasOneBackup(t *testing.T) {
 	connectEngines(t, a, b, nil)
 	connectEngines(t, b, c, nil)
 	connectEngines(t, a, c, nil)
-	waitIndexes(t, 2, a, b, c)
-	for _, e := range []*Engine{a, b, c} {
-		_, entries := e.Entries()
-		for _, entry := range entries {
-			if strings.Contains(entry.Path, ".sync-conflict-") {
-				waitBytes(t, filepath.Join(e.Root, entry.Path), []byte(loser))
-			}
+	waitIndexes(t, 1, a, b, c)
+	var backupID string
+	for _, e := range []*Engine{a, c} {
+		items, err := ListConflicts(e.IndexPath)
+		if err != nil || len(items) != 1 {
+			t.Fatalf("backups: %v, %v", items, err)
 		}
+		if backupID != "" && backupID != items[0].ID {
+			t.Fatal("same losing version has different backup IDs")
+		}
+		backupID = items[0].ID
+		waitBytes(t, filepath.Join(ConflictDir(e.IndexPath), backupID+".data"), []byte(loser))
 		scan(t, e)
 	}
-	waitIndexes(t, 2, a, b, c)
+	items, err := ListConflicts(b.IndexPath)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("backups propagated to another device: %v, %v", items, err)
+	}
+	waitIndexes(t, 1, a, b, c)
 }
 
 func TestConcurrentMetadataConverges(t *testing.T) {

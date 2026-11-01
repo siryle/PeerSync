@@ -145,7 +145,8 @@ static void installMenu(void) {
 }
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
 	(void)sender;
-	// Normal termination is initiated only by our status-menu action.
+	// Dock quit must use the same asynchronous cleanup as the status menu.
+	[self quit:nil];
 	return NSTerminateCancel;
 }
 - (BOOL)windowShouldClose:(NSWindow *)sender {
