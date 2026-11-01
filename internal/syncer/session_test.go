@@ -21,10 +21,12 @@ func TestStreamAndDeltaTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = a.Close() })
 	b, err := Open(dirB, filepath.Join(t.TempDir(), "b.json"), "device-b", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = b.Close() })
 	// Distinct bytes per block, so a one-byte insert does not collide with an
 	// aligned block and the transfer has to use the rolling checksum.
 	shift := patterned(2 * protoBlock())

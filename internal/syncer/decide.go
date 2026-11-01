@@ -2,6 +2,8 @@ package syncer
 
 import (
 	"bytes"
+	"sort"
+	"strings"
 
 	"github.com/netcraft/peersync/internal/proto"
 	"github.com/netcraft/peersync/internal/vclock"
@@ -35,6 +37,14 @@ func Plan(self string, local map[string]*File, remote []proto.Entry) []Task {
 		}
 		tasks = append(tasks, decide(self, local[r.Path], r)...)
 	}
+	// Remove children before parents, keeping other tasks in their original order.
+	sort.SliceStable(tasks, func(i, j int) bool {
+		a, b := tasks[i], tasks[j]
+		if (a.Op == opDelete) != (b.Op == opDelete) {
+			return b.Op == opDelete
+		}
+		return a.Op == opDelete && strings.Count(a.Path, "/") > strings.Count(b.Path, "/")
+	})
 	return tasks
 }
 
@@ -121,8 +131,15 @@ func concurrent(self string, local *File, base Task, r proto.Entry) []Task {
 		base.Version = vclock.Bump(merged, self)
 		return []Task{base}
 	}
+	if !r.IsDir {
+		remoteSum, ok := proto.DecodeSum(r.Sum)
+		if !ok || bytes.Compare(local.Sum[:], remoteSum[:]) > 0 {
+			// The winner waits for the loser to save its copy and merge the clocks.
+			return nil
+		}
+	}
 	base.Op = opConflict
-	base.Version = vclock.Clone(r.Version)
+	base.Version = merged
 	return []Task{base}
 }
 

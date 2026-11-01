@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -255,24 +254,6 @@ func EncodeBlock(reqID uint32, index int, data []byte, errText string) []byte {
 	binary.BigEndian.PutUint16(buf[8:10], 0)
 	buf = append(buf, data...)
 	return buf
-}
-
-// DecodeBlock parses a block response.
-func DecodeBlock(b []byte) (reqID uint32, index int, data []byte, errText string, err error) {
-	if len(b) < 10 {
-		return 0, 0, nil, "", errors.New("short block")
-	}
-	reqID = binary.BigEndian.Uint32(b[0:4])
-	index = int(binary.BigEndian.Uint32(b[4:8]))
-	status := binary.BigEndian.Uint16(b[8:10])
-	rest := b[10:]
-	if status == 1 {
-		return reqID, index, nil, string(rest), nil
-	}
-	if status != 0 {
-		return 0, 0, nil, "", errors.New("bad block status")
-	}
-	return reqID, index, rest, "", nil
 }
 
 // BlobSpan is a contiguous run of blocks inside a raw transfer.
@@ -565,14 +546,4 @@ func DecodeSum(s string) (sum [32]byte, ok bool) {
 	}
 	copy(sum[:], raw)
 	return sum, true
-}
-
-// MustJSON marshals v or panics. Callers use it for small protocol structs
-// whose shape cannot fail.
-func MustJSON(v any) []byte {
-	b, err := json.Marshal(v)
-	if err != nil {
-		panic(err)
-	}
-	return b
 }

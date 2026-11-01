@@ -16,6 +16,8 @@ import (
 // Serve runs directory sync on an already authenticated connection until it
 // fails or ctx is cancelled.
 func Serve(ctx context.Context, e *Engine, conn *frame.Conn, log *slog.Logger, note func(Note)) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if log == nil {
 		log = e.Log
 	}
@@ -31,35 +33,31 @@ func Serve(ctx context.Context, e *Engine, conn *frame.Conn, log *slog.Logger, n
 	}
 	sub, unsub := e.Subscribe()
 	defer unsub()
-	defer s.failAll(errors.New("connection closed"))
-
 	errc := make(chan error, 3)
-	go func() { errc <- s.readLoop() }()
-	go func() { errc <- s.syncLoop(sub) }()
-	go func() { errc <- s.pingLoop() }()
+	var loops sync.WaitGroup
+	for _, run := range []func() error{s.readLoop, func() error { return s.syncLoop(sub) }, s.pingLoop} {
+		loops.Go(func() { errc <- run() })
+	}
+	var err error
 	select {
 	case <-ctx.Done():
-		_ = conn.Close()
-		<-errc
-		return ctx.Err()
-	case err := <-errc:
-		_ = conn.Close()
-		return err
+		err = ctx.Err()
+	case err = <-errc:
 	}
+	cancel()
+	_ = conn.Close()
+	s.failAll(errors.New("connection closed"))
+	loops.Wait()
+	s.work.Wait()
+	return err
 }
 
 type waiter struct {
 	kind  byte
 	meta  chan proto.Meta
-	data  chan blockResult
 	blobs chan blobPiece
 	done  chan struct{}
 	asm   *metaAsm
-}
-
-type blockResult struct {
-	data []byte
-	err  error
 }
 
 type session struct {
@@ -71,6 +69,8 @@ type session struct {
 	next       atomic.Uint32
 	indexReady chan []proto.Entry
 	blobSem    chan struct{}
+	retry      atomic.Bool
+	work       sync.WaitGroup
 
 	pendMu  sync.Mutex
 	pending map[uint32]*waiter
@@ -103,13 +103,11 @@ func (s *session) readLoop() error {
 			// Answer off the read loop. A multi-megabyte block list must not
 			// stall the frames of a file that is already streaming.
 			body := append([]byte(nil), payload...)
-			go s.onMetaReq(body)
+			s.work.Go(func() { s.onMetaReq(body) })
 		case proto.TypeMeta:
 			s.onMeta(payload)
 		case proto.TypeBlockReq:
 			s.onBlockReq(payload)
-		case proto.TypeBlock:
-			s.onBlock(payload)
 		case proto.TypeBlobReq:
 			body := append([]byte(nil), payload...)
 			s.onBlobReq(body)
@@ -144,10 +142,16 @@ func (s *session) syncLoop(sub <-chan struct{}) error {
 	// may still be the previous run's tombstones, and announcing it would
 	// delete the peer's copies.
 	ready := s.e.Ready()
+	retry := time.NewTicker(2 * time.Second)
+	defer retry.Stop()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return s.ctx.Err()
+		case <-retry.C:
+			if ready == nil && have && s.retry.Swap(false) {
+				s.reconcile(remote)
+			}
 		case <-ready:
 			ready = nil
 			if err := s.sendIndex(); err != nil {
@@ -253,17 +257,9 @@ func (s *session) reconcile(remote []proto.Entry) {
 			return
 		}
 		switch task.Op {
-		case opPull:
-			pulls = append(pulls, task)
-			continue
-		case opConflict:
-			err := s.e.StageConflict(task)
-			if err != nil {
-				if !errors.Is(err, errStale) {
-					s.log.Warn("sync step failed", "op", task.Op, "path", task.Path, "err", err)
-				}
-				s.done(task, err)
-				continue
+		case opPull, opConflict:
+			if task.Remote.IsDir {
+				break
 			}
 			pulls = append(pulls, task)
 			continue
@@ -274,7 +270,7 @@ func (s *session) reconcile(remote []proto.Entry) {
 			err = s.e.ApplyDelete(task)
 		case opMerge:
 			err = s.e.ApplyMerge(task)
-		case opDir:
+		case opDir, opConflict:
 			err = s.e.ApplyDir(task)
 		}
 		if err != nil && !errors.Is(err, errStale) {
@@ -286,6 +282,12 @@ func (s *session) reconcile(remote []proto.Entry) {
 }
 
 func (s *session) done(task Task, err error) {
+	if errors.Is(err, errIgnored) {
+		return
+	}
+	if err != nil {
+		s.retry.Store(true)
+	}
 	if s.note == nil || errors.Is(err, errStale) {
 		return
 	}
@@ -416,7 +418,7 @@ func (s *session) onBlobReq(payload []byte) {
 	}
 	// Streaming from the read loop deadlocks when both peers push a large
 	// file at once: neither side reads until its write finishes.
-	go s.serveBlob(req)
+	s.work.Go(func() { s.serveBlob(req) })
 }
 
 func (s *session) onBlob(payload []byte) {
@@ -444,27 +446,6 @@ func (s *session) onBlob(payload []byte) {
 	}
 }
 
-func (s *session) onBlock(payload []byte) {
-	reqID, _, data, errText, err := proto.DecodeBlock(payload)
-	if err != nil {
-		return
-	}
-	s.pendMu.Lock()
-	w, ok := s.pending[reqID]
-	s.pendMu.Unlock()
-	if !ok || w.kind != proto.TypeBlock {
-		return
-	}
-	res := blockResult{data: data}
-	if errText != "" {
-		res.err = errors.New(errText)
-	}
-	select {
-	case w.data <- res:
-	default:
-	}
-}
-
 func (s *session) awaitMeta(id uint32, typ byte, body []byte, timeout time.Duration) (proto.Meta, error) {
 	ch := make(chan proto.Meta, 1)
 	s.pendMu.Lock()
@@ -486,30 +467,6 @@ func (s *session) awaitMeta(id uint32, typ byte, body []byte, timeout time.Durat
 	}
 }
 
-func (s *session) awaitBlock(id uint32, body []byte, timeout time.Duration) ([]byte, error) {
-	ch := make(chan blockResult, 1)
-	s.pendMu.Lock()
-	s.pending[id] = &waiter{kind: proto.TypeBlock, data: ch}
-	s.pendMu.Unlock()
-	defer s.forget(id)
-	if err := s.conn.Write(proto.TypeBlockReq, body); err != nil {
-		return nil, err
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-s.ctx.Done():
-		return nil, s.ctx.Err()
-	case <-timer.C:
-		return nil, errors.New("block timed out")
-	case res := <-ch:
-		if res.err != nil {
-			return nil, res.err
-		}
-		return res.data, nil
-	}
-}
-
 func (s *session) forget(id uint32) {
 	s.pendMu.Lock()
 	defer s.pendMu.Unlock()
@@ -527,12 +484,6 @@ func (s *session) failAll(err error) {
 		if w.meta != nil {
 			select {
 			case w.meta <- proto.Meta{Err: err.Error()}:
-			default:
-			}
-		}
-		if w.data != nil {
-			select {
-			case w.data <- blockResult{err: err}:
 			default:
 			}
 		}

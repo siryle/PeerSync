@@ -121,8 +121,9 @@ type Node struct {
 	stunNonce  atomic.Uint64
 	kick       chan struct{}
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx     context.Context
+	cancel  context.CancelFunc
+	workers sync.WaitGroup
 
 	mu        sync.Mutex
 	peers     map[string]*peerState
@@ -208,6 +209,12 @@ func prepare(ctx context.Context, opt Options) (*Node, error) {
 			HandshakeIdleTimeout: 8 * time.Second,
 		},
 	}
+	prepared := false
+	defer func() {
+		if !prepared {
+			n.close()
+		}
+	}()
 	for _, sh := range cfg.Shares {
 		if err := n.addShare(sh); err != nil {
 			cancel()
@@ -239,6 +246,7 @@ func prepare(ctx context.Context, opt Options) (*Node, error) {
 	}
 	n.stunServer = stun
 	n.log.Info("peersync device", "id", id.DeviceID(), "name", cfg.DeviceName, "tcp", n.tcpLn.Addr(), "udp", n.udp.LocalAddr())
+	prepared = true
 	return n, nil
 }
 
@@ -381,6 +389,10 @@ func (n *Node) closeListeners() {
 func (n *Node) close() {
 	n.cancel()
 	n.closeListeners()
+	n.workers.Wait()
+	for _, sh := range n.shares {
+		_ = sh.engine.Close()
+	}
 }
 
 func (n *Node) stunLoop() {
@@ -549,8 +561,9 @@ func (n *Node) onSignal(shareID, from string, sealed []byte) {
 	}
 	st.tcp = append([]string(nil), body.TCP...)
 	st.udp = append([]string(nil), body.UDP...)
+	name := st.name
 	n.mu.Unlock()
-	n.ensurePeer(shareID, discover.Peer{ID: from, Name: st.name})
+	n.ensurePeer(shareID, discover.Peer{ID: from, Name: name})
 }
 
 func (n *Node) syncPeers(shareID string, peers []discover.Peer) {
@@ -605,7 +618,7 @@ func (n *Node) ensurePeer(shareID string, p discover.Peer) {
 	ctx, cancel := context.WithCancel(n.ctx)
 	st.cancel = cancel
 	n.mu.Unlock()
-	go n.watch(ctx, shareID, p.ID)
+	n.workers.Go(func() { n.watch(ctx, shareID, p.ID) })
 }
 
 func (n *Node) dropPeer(shareID, id string) {

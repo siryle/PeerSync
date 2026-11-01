@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -81,17 +80,4 @@ func (c *Conn) Read(deadline time.Time) (byte, []byte, error) {
 // Close closes the underlying stream.
 func (c *Conn) Close() error {
 	return c.s.Close()
-}
-
-// LocalAddrString is optional diagnostic text carried alongside a stream.
-type localAddr interface {
-	RemoteAddrString() string
-}
-
-// Describe returns a short error that includes the frame type.
-func Describe(typ byte, err error) error {
-	if err == nil {
-		return nil
-	}
-	return fmt.Errorf("frame type %d: %w", typ, err)
 }

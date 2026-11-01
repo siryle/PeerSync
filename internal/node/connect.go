@@ -26,7 +26,7 @@ func (n *Node) acceptTCP() {
 		if err != nil {
 			return
 		}
-		go func(conn net.Conn) {
+		n.workers.Go(func() {
 			tuneTCP(conn)
 			tlsConn := tls.Server(conn, n.serverTLS)
 			hctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
@@ -37,7 +37,7 @@ func (n *Node) acceptTCP() {
 				return
 			}
 			_ = n.finish(n.ctx, tlsConn, tlsConn.ConnectionState(), false, "", "", conn.RemoteAddr().String(), nil)
-		}(conn)
+		})
 	}
 }
 
@@ -47,14 +47,14 @@ func (n *Node) acceptQUIC() {
 		if err != nil {
 			return
 		}
-		go func(conn *quic.Conn) {
+		n.workers.Go(func() {
 			defer conn.CloseWithError(0, "bye")
 			stream, err := conn.AcceptStream(conn.Context())
 			if err != nil {
 				return
 			}
 			_ = n.finish(n.ctx, stream, conn.ConnectionState().TLS, false, "", "", conn.RemoteAddr().String(), nil)
-		}(conn)
+		})
 	}
 }
 
@@ -254,6 +254,8 @@ func (s *quicStream) Close() error {
 func (n *Node) finish(ctx context.Context, stream frame.Stream, cs tls.ConnectionState, isClient bool, shareID, peerID, addr string, onReady func()) error {
 	fc := frame.New(stream)
 	defer fc.Close()
+	stopClose := context.AfterFunc(ctx, func() { _ = fc.Close() })
+	defer stopClose()
 	var remote proto.Auth
 	var sh *liveShare
 	if isClient {

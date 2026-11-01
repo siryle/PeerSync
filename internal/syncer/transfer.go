@@ -1,12 +1,12 @@
 package syncer
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -119,7 +119,7 @@ func (s *session) download(task Task) error {
 		closed = true
 		return tmp.Close()
 	}
-	defer func() { _ = os.Remove(tmpName) }()
+	defer func() { _ = s.e.root.Remove(tmpName) }()
 	defer closeTmp()
 
 	plan := s.planTransfer(task.Path, meta.Blocks, task.Remote.Size)
@@ -149,6 +149,9 @@ func (s *session) download(task Task) error {
 		return err
 	}
 	if err := closeTmp(); err != nil {
+		return err
+	}
+	if err := s.ctx.Err(); err != nil {
 		return err
 	}
 	return s.e.CommitDownload(task, tmpName, meta.Blocks)
@@ -192,15 +195,15 @@ func (s *session) fetchMeta(task Task) (proto.Meta, error) {
 }
 
 func (s *session) createTemp() (*os.File, string, error) {
-	dir := filepath.Join(s.e.Root, tmpDirName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := s.e.root.MkdirAll(tmpDirName, 0o700); err != nil {
 		return nil, "", err
 	}
-	f, err := os.CreateTemp(dir, "part-*")
+	name := tmpDirName + "/part-" + rand.Text()
+	f, err := s.e.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, "", err
 	}
-	return f, f.Name(), nil
+	return f, name, nil
 }
 
 func (s *session) planTransfer(rel string, blocks [][32]byte, remoteSize int64) xferPlan {
@@ -212,8 +215,12 @@ func (s *session) planTransfer(rel string, blocks [][32]byte, remoteSize int64) 
 	if err != nil || localSize <= 0 {
 		return all
 	}
-	abs := filepath.Join(s.e.Root, filepath.FromSlash(rel))
-	info, err := os.Stat(abs)
+	f, err := s.e.openFile(rel)
+	if err != nil {
+		return all
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil || info.IsDir() || info.Size() != localSize {
 		return all
 	}
@@ -227,7 +234,7 @@ func (s *session) planTransfer(rel string, blocks [][32]byte, remoteSize int64) 
 		}
 	}
 	if len(missing) == 0 {
-		return xferPlan{kind: planLocal, basis: abs}
+		return xferPlan{kind: planLocal, basis: rel}
 	}
 	if float64(matched)/float64(len(blocks)) >= alignedKeep {
 		spans := spansOf(missing)
@@ -242,14 +249,14 @@ func (s *session) planTransfer(rel string, blocks [][32]byte, remoteSize int64) 
 					keep = append(keep, i)
 				}
 			}
-			return xferPlan{kind: planRanges, keep: keep, spans: spans, basis: abs}
+			return xferPlan{kind: planRanges, keep: keep, spans: spans, basis: rel}
 		}
 	}
 	nFull := int(localSize / int64(proto.BlockSize))
 	if nFull >= 1 && nFull <= proto.MaxDeltaBlocks && sizesClose(localSize, remoteSize) {
-		sigs, err := basisSigs(abs, nFull)
+		sigs, err := s.basisSigs(rel, nFull)
 		if err == nil {
-			return xferPlan{kind: planDelta, sigs: sigs, basis: abs, basisFull: nFull}
+			return xferPlan{kind: planDelta, sigs: sigs, basis: rel, basisFull: nFull}
 		}
 	}
 	return all
@@ -287,8 +294,8 @@ func spansOf(idxs []int) []proto.BlobSpan {
 	return out
 }
 
-func basisSigs(path string, nFull int) ([]proto.BasisSig, error) {
-	f, err := os.Open(path)
+func (s *session) basisSigs(path string, nFull int) ([]proto.BasisSig, error) {
+	f, err := s.e.openFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -305,7 +312,7 @@ func basisSigs(path string, nFull int) ([]proto.BasisSig, error) {
 }
 
 func (s *session) fillFromLocal(dst *os.File, srcPath string, n int64, want [][32]byte) error {
-	src, err := os.Open(srcPath)
+	src, err := s.e.openFile(srcPath)
 	if err != nil {
 		return err
 	}
@@ -325,7 +332,7 @@ func (s *session) fillRanges(dst *os.File, task Task, meta proto.Meta, plan xfer
 	if err := dst.Truncate(task.Remote.Size); err != nil {
 		return err
 	}
-	if err := writeKept(dst, plan.basis, task.Remote.Size, meta.Blocks, plan.keep); err != nil {
+	if err := s.writeKept(dst, plan.basis, task.Remote.Size, meta.Blocks, plan.keep); err != nil {
 		return err
 	}
 	var last error
@@ -334,7 +341,7 @@ func (s *session) fillRanges(dst *os.File, task Task, meta proto.Meta, plan xfer
 			return err
 		}
 		if try > 0 {
-			if err := writeKept(dst, plan.basis, task.Remote.Size, meta.Blocks, plan.keep); err != nil {
+			if err := s.writeKept(dst, plan.basis, task.Remote.Size, meta.Blocks, plan.keep); err != nil {
 				return err
 			}
 		}
@@ -546,7 +553,7 @@ func (s *session) recvDelta(dst *os.File, task Task, meta proto.Meta, plan xferP
 		return err
 	}
 	defer s.forget(req.ReqID)
-	basis, err := os.Open(plan.basis)
+	basis, err := s.e.openFile(plan.basis)
 	if err != nil {
 		return errNeedWhole
 	}
@@ -595,8 +602,8 @@ func (s *session) recvDelta(dst *os.File, task Task, meta proto.Meta, plan xferP
 	return nil
 }
 
-func writeKept(dst *os.File, srcPath string, remoteSize int64, want [][32]byte, keep []int) error {
-	src, err := os.Open(srcPath)
+func (s *session) writeKept(dst *os.File, srcPath string, remoteSize int64, want [][32]byte, keep []int) error {
+	src, err := s.e.openFile(srcPath)
 	if err != nil {
 		return err
 	}
@@ -673,7 +680,7 @@ func (s *session) serveRaw(req proto.BlobReq) error {
 	if !validSpans(spans, len(blocks)) {
 		return errors.New("bad spans")
 	}
-	f, err := os.Open(filepath.Join(s.e.Root, filepath.FromSlash(req.Path)))
+	f, err := s.e.openFile(req.Path)
 	if err != nil {
 		return err
 	}
@@ -752,7 +759,7 @@ func (s *session) serveDelta(req proto.BlobReq) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.Open(filepath.Join(s.e.Root, filepath.FromSlash(req.Path)))
+	f, err := s.e.openFile(req.Path)
 	if err != nil {
 		return err
 	}

@@ -18,6 +18,7 @@ func TestScanEditAndDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = e.Close() })
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("one"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +69,7 @@ func TestScanUnreadableDirDoesNotTombstone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = e.Close() })
 	sub := filepath.Join(root, "sub")
 	if err := os.MkdirAll(sub, 0o755); err != nil {
 		t.Fatal(err)
@@ -115,6 +117,7 @@ func TestScanUnreadableRootDoesNotWipe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = e.Close() })
 	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("one"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +149,7 @@ func TestFirstScanFailureDoesNotAnnounce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = e.Close() })
 	if err := os.Chmod(root, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +175,7 @@ func TestBatchWritesIndexOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = e.Close() })
 	if err := e.Scan(); err != nil {
 		t.Fatal(err)
 	}

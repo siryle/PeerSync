@@ -51,6 +51,7 @@ type Engine struct {
 	IndexPath string
 	Self      string
 	Log       *slog.Logger
+	root      *os.Root
 
 	mu       sync.Mutex
 	idx      indexFile
@@ -73,15 +74,17 @@ func Open(root, indexPath, self string, log *slog.Logger) (*Engine, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	info, err := os.Stat(root)
+	abs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
 	}
-	if !info.IsDir() {
-		return nil, errors.New("share path is not a directory")
+	dir, err := os.OpenRoot(abs)
+	if err != nil {
+		return nil, err
 	}
 	e := &Engine{
-		Root:      root,
+		Root:      abs,
+		root:      dir,
 		IndexPath: indexPath,
 		Self:      self,
 		Log:       log,
@@ -94,9 +97,12 @@ func Open(root, indexPath, self string, log *slog.Logger) (*Engine, error) {
 		e.Log.Warn("index unreadable, scanning as a new folder", "err", err, "path", indexPath)
 		e.idx = indexFile{Files: map[string]*File{}}
 	}
-	_ = os.RemoveAll(filepath.Join(root, tmpDirName))
+	_ = dir.RemoveAll(tmpDirName)
 	return e, nil
 }
+
+// Close releases the shared directory handle after its workers have stopped.
+func (e *Engine) Close() error { return e.root.Close() }
 
 func (e *Engine) load() error {
 	b, err := os.ReadFile(e.IndexPath)
@@ -191,12 +197,9 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 				}
 			}
 			timer.Reset(300 * time.Millisecond)
-		case ev, ok := <-watcher.Events:
+		case _, ok := <-watcher.Events:
 			if !ok {
 				return nil
-			}
-			if rel, err := relOf(e.Root, ev.Name); err == nil {
-				_ = rel
 			}
 			e.Kick()
 		case err, ok := <-watcher.Errors:
@@ -262,13 +265,13 @@ func (e *Engine) Scan() error {
 	// tombstoned: a failed listing is not evidence that the files are gone.
 	var unread []string
 	var rootErr error
-	err := filepath.WalkDir(e.Root, func(abs string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(e.root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
 		if err != nil {
-			if abs == e.Root {
+			if rel == "." {
 				rootErr = err
 				return filepath.SkipAll
 			}
-			if rel, relErr := relOf(e.Root, abs); relErr == nil {
+			if ValidRel(rel) {
 				unread = append(unread, rel)
 			}
 			if d != nil && d.IsDir() {
@@ -276,14 +279,16 @@ func (e *Engine) Scan() error {
 			}
 			return nil
 		}
-		if abs == e.Root {
+		if rel == "." {
 			return nil
 		}
 		if d == nil {
 			return nil
 		}
-		rel, err := relOf(e.Root, abs)
-		if err != nil {
+		if !ValidRel(rel) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		if d.Type()&os.ModeSymlink != 0 {
@@ -301,6 +306,9 @@ func (e *Engine) Scan() error {
 		info, err := d.Info()
 		if err != nil {
 			unread = append(unread, rel)
+			return nil
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
 			return nil
 		}
 		items = append(items, item{
@@ -322,7 +330,9 @@ func (e *Engine) Scan() error {
 	e.mu.Lock()
 	snap := make(map[string]*File, len(e.idx.Files))
 	for k, v := range e.idx.Files {
-		snap[k] = v
+		cp := *v
+		cp.Version = vclock.Clone(v.Version)
+		snap[k] = &cp
 	}
 	inflight := make(map[string]int, len(e.inflight))
 	for k, v := range e.inflight {
@@ -344,7 +354,7 @@ func (e *Engine) Scan() error {
 		if prev != nil && !prev.Deleted && !prev.IsDir && prev.Size == it.size && prev.ModTime == it.mtime && len(prev.Blocks) == BlocksForSize(it.size) {
 			continue
 		}
-		sum, blocks, size, err := HashFile(filepath.Join(e.Root, filepath.FromSlash(it.rel)))
+		sum, blocks, size, err := e.hashFile(it.rel)
 		if err != nil {
 			e.Log.Debug("hash", "path", it.rel, "err", err)
 			continue
@@ -362,6 +372,10 @@ func (e *Engine) Scan() error {
 			continue
 		}
 		seen[it.rel] = true
+		if cur, prev := e.idx.Files[it.rel], snap[it.rel]; (cur == nil) != (prev == nil) || (cur != nil && vclock.Compare(cur.Version, prev.Version) != 0) {
+			e.Kick()
+			continue
+		}
 		if it.dir {
 			if e.upsertDir(it.rel, it.mode) {
 				changed = true
@@ -420,7 +434,12 @@ func unreadCovers(unread []string, rel string) bool {
 
 func (e *Engine) ignores() ignore.Set {
 	s := ignore.Defaults()
-	b, err := os.ReadFile(filepath.Join(e.Root, ".peersyncignore"))
+	f, err := e.openFile(".peersyncignore")
+	if err != nil {
+		return s
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
 	if err != nil {
 		return s
 	}
@@ -483,8 +502,16 @@ func (e *Engine) Entries() (uint64, []proto.Entry) {
 
 // Plan builds work items for a remote index.
 func (e *Engine) Plan(remote []proto.Entry) []Task {
+	ig := e.ignores()
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	filtered := make([]proto.Entry, 0, len(remote))
+	for _, entry := range remote {
+		cur := e.idx.Files[entry.Path]
+		if !ig.Match(entry.Path, entry.IsDir || (cur != nil && cur.IsDir)) {
+			filtered = append(filtered, entry)
+		}
+	}
 	local := make(map[string]*File, len(e.idx.Files))
 	for k, v := range e.idx.Files {
 		cp := *v
@@ -492,13 +519,16 @@ func (e *Engine) Plan(remote []proto.Entry) []Task {
 		cp.Blocks = nil
 		local[k] = &cp
 	}
-	return Plan(e.Self, local, remote)
+	return Plan(e.Self, local, filtered)
 }
 
 // Meta returns the block list of a non-deleted file.
 func (e *Engine) Meta(rel string) (sum [32]byte, blocks [][32]byte, size int64, err error) {
 	if !ValidRel(rel) {
 		return sum, nil, 0, errors.New("bad path")
+	}
+	if e.ignores().Match(rel, false) {
+		return sum, nil, 0, os.ErrNotExist
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -519,7 +549,12 @@ func (e *Engine) ReadBlock(rel string, index int) ([]byte, error) {
 	if index < 0 || index >= len(blocks) {
 		return nil, errors.New("block out of range")
 	}
-	data, err := ReadBlock(filepath.Join(e.Root, filepath.FromSlash(rel)), index, size)
+	f, err := e.openFile(rel)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	data, err := ReadBlock(f, index, size)
 	if err != nil {
 		return nil, err
 	}
@@ -549,166 +584,158 @@ func (e *Engine) End(rel string) {
 	e.mu.Unlock()
 }
 
-// ApplyDelete records a remote deletion.
+// ApplyDelete records a remote deletion only after removing the disk entry.
 func (e *Engine) ApplyDelete(task Task) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	cur := e.idx.Files[task.Path]
-	if !unchanged(cur, task) {
-		return errStale
-	}
-	if cur != nil && !cur.Deleted && !cur.IsDir {
-		_ = os.Remove(filepath.Join(e.Root, filepath.FromSlash(task.Path)))
-	}
-	if cur != nil && cur.IsDir {
-		_ = os.Remove(filepath.Join(e.Root, filepath.FromSlash(task.Path)))
-	}
-	e.idx.Files[task.Path] = &File{Deleted: true, Version: vclock.Clone(task.Version)}
-	e.idx.Seq++
-	if err := e.persistLocked(); err != nil {
+	if err := e.checkLocalLocked(task); err != nil {
 		return err
 	}
-	return nil
+	if err := e.root.Remove(task.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	e.idx.Files[task.Path] = &File{Deleted: true, IsDir: task.Remote.IsDir, Version: vclock.Clone(task.Version)}
+	e.idx.Seq++
+	return e.persistLocked()
 }
 
 // ApplyMerge stores a version that already describes the bytes on disk.
 func (e *Engine) ApplyMerge(task Task) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	cur := e.idx.Files[task.Path]
-	if !unchanged(cur, task) {
-		return errStale
+	if err := e.checkLocalLocked(task); err != nil {
+		return err
 	}
+	cur := e.idx.Files[task.Path]
 	if cur == nil {
 		return nil
 	}
 	cur.Version = vclock.Clone(task.Version)
 	e.idx.Seq++
-	if err := e.persistLocked(); err != nil {
-		return err
-	}
-	return nil
+	return e.persistLocked()
 }
 
 // ApplyDir creates a directory from a remote index entry.
 func (e *Engine) ApplyDir(task Task) error {
-	if !ValidRel(task.Path) {
-		return errors.New("bad path")
-	}
-	abs := filepath.Join(e.Root, filepath.FromSlash(task.Path))
-	e.mu.Lock()
-	cur := e.idx.Files[task.Path]
-	if !unchanged(cur, task) {
-		e.mu.Unlock()
-		return errStale
-	}
-	e.mu.Unlock()
-
-	e.Begin(task.Path)
-	defer e.End(task.Path)
-	if info, err := os.Lstat(abs); err == nil && !info.IsDir() {
-		if err := e.StageConflict(task); err != nil {
-			return err
-		}
-		if err := os.Remove(abs); err != nil {
-			return err
-		}
-	}
-	if err := os.MkdirAll(abs, fileMode(task.Remote.Mode, true)); err != nil {
-		return err
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	cur = e.idx.Files[task.Path]
-	if cur != nil && !cur.Deleted && cur.IsDir && vclock.Compare(cur.Version, task.Version) == 1 {
-		return nil
-	}
-	e.idx.Files[task.Path] = &File{
-		IsDir:   true,
-		Mode:    task.Remote.Mode,
-		Version: vclock.Clone(task.Version),
-	}
-	e.idx.Seq++
-	if err := e.persistLocked(); err != nil {
+	if err := e.checkLocalLocked(task); err != nil {
 		return err
 	}
-	return nil
+	if cur := e.idx.Files[task.Path]; cur != nil && !cur.Deleted && !cur.IsDir {
+		if err := e.stageConflictLocked(task); err != nil {
+			return err
+		}
+		if err := e.root.Remove(task.Path); err != nil {
+			return err
+		}
+	}
+	if err := e.root.MkdirAll(task.Path, fileMode(task.Remote.Mode, true)); err != nil {
+		return err
+	}
+	e.idx.Files[task.Path] = &File{IsDir: true, Mode: task.Remote.Mode, Version: vclock.Clone(task.Version)}
+	e.idx.Seq++
+	return e.persistLocked()
 }
 
-// StageConflict copies a locally edited file aside so the remote version can
-// take the original name. The original file is left in place until the
-// download commits.
-func (e *Engine) StageConflict(task Task) error {
-	if !ValidRel(task.Path) {
-		return errors.New("bad path")
-	}
-	e.mu.Lock()
+// stageConflictLocked saves a verified local version only when its replacement is ready.
+func (e *Engine) stageConflictLocked(task Task) error {
 	cur := e.idx.Files[task.Path]
-	if !unchanged(cur, task) || cur == nil || cur.Deleted || cur.IsDir {
-		e.mu.Unlock()
+	if cur == nil || cur.Deleted || cur.IsDir {
 		return errStale
 	}
-	ver := vclock.Bump(cur.Version, e.Self)
-	mode := cur.Mode
-	e.mu.Unlock()
-
-	name := conflictName(task.Path, e.Self, time.Now())
-	for i := 0; ; i++ {
-		if ValidRel(name) {
-			if _, err := os.Lstat(filepath.Join(e.Root, filepath.FromSlash(name))); errors.Is(err, os.ErrNotExist) {
-				break
+	// A retry must find the same backup instead of producing another conflict.
+	stamp := time.Unix(0, cur.ModTime)
+	for i := 0; i < 100; i++ {
+		name := conflictName(task.Path, e.Self, stamp.Add(time.Duration(i)*time.Millisecond))
+		if !ValidRel(name) {
+			return errors.New("conflict path too long")
+		}
+		out, err := e.root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, fileMode(cur.Mode, false))
+		if errors.Is(err, os.ErrExist) {
+			sum, _, _, hashErr := e.hashFile(name)
+			if hashErr == nil && sum == cur.Sum {
+				return nil
 			}
+			continue
 		}
-		name = conflictName(task.Path, e.Self, time.Now().Add(time.Duration(i+1)*time.Millisecond))
-		if i > 20 {
-			return errors.New("could not pick a conflict name")
+		if err != nil {
+			return err
 		}
+		in, err := e.openFile(task.Path)
+		if err == nil {
+			_, err = io.Copy(out, in)
+			_ = in.Close()
+		}
+		if err == nil {
+			err = out.Sync()
+		}
+		if err == nil {
+			_, err = out.Seek(0, io.SeekStart)
+		}
+		var sum [32]byte
+		var blocks [][32]byte
+		var size int64
+		if err == nil {
+			sum, blocks, size, err = HashReader(out)
+		}
+		info, statErr := out.Stat()
+		closeErr := out.Close()
+		if err == nil {
+			err = statErr
+		}
+		if err == nil {
+			err = closeErr
+		}
+		if err == nil && (sum != cur.Sum || size != cur.Size) {
+			err = errStale
+		}
+		if err != nil {
+			_ = e.root.Remove(name)
+			return err
+		}
+		e.idx.Files[name] = &File{
+			Size: size, ModTime: info.ModTime().UnixNano(), Mode: cur.Mode,
+			Sum: sum, Blocks: blocks, Version: vclock.Bump(cur.Version, e.Self),
+		}
+		e.idx.Seq++
+		return e.persistLocked()
 	}
-	e.Begin(name)
-	defer e.End(name)
-	src := filepath.Join(e.Root, filepath.FromSlash(task.Path))
-	dst := filepath.Join(e.Root, filepath.FromSlash(name))
-	if err := copyFile(src, dst, fileMode(mode, false)); err != nil {
-		return err
-	}
-	sum, blocks, size, err := HashFile(dst)
-	if err != nil {
-		_ = os.Remove(dst)
-		return err
-	}
-	info, err := os.Stat(dst)
-	if err != nil {
-		return err
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.idx.Files[name] = &File{
-		Size: size, ModTime: info.ModTime().UnixNano(), Mode: uint32(info.Mode().Perm()),
-		Sum: sum, Blocks: blocks, Version: ver,
-	}
-	e.idx.Seq++
-	if err := e.persistLocked(); err != nil {
-		return err
-	}
-	return nil
+	return errors.New("could not pick a conflict name")
 }
 
-// CommitDownload moves a finished temp file into the share and records the
-// remote version, without counting it as a new local edit.
+// CommitDownload checks local changes before replacing any bytes on disk.
 func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error {
-	if !ValidRel(task.Path) {
-		return errors.New("bad path")
-	}
 	sum := SumBlocks(blocks)
 	want, ok := proto.DecodeSum(task.Remote.Sum)
 	if !ok || want != sum {
 		return errors.New("downloaded checksum mismatch")
 	}
-	if BlocksForSize(task.Remote.Size) != len(blocks) {
+	if task.Remote.Size < 0 || BlocksForSize(task.Remote.Size) != len(blocks) {
 		return errors.New("downloaded size mismatch")
 	}
-	abs := filepath.Join(e.Root, filepath.FromSlash(task.Path))
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+	if filepath.IsAbs(tmp) {
+		var err error
+		tmp, err = filepath.Rel(e.Root, tmp)
+		if err != nil {
+			return err
+		}
+	}
+	if !filepath.IsLocal(tmp) {
+		return errors.New("bad temporary path")
+	}
+	tmp = filepath.ToSlash(tmp)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.checkLocalLocked(task); err != nil {
+		return err
+	}
+	if task.Op == opConflict {
+		if err := e.stageConflictLocked(task); err != nil {
+			return err
+		}
+	}
+	if err := e.root.MkdirAll(path.Dir(task.Path), 0o755); err != nil {
 		return err
 	}
 	mode := fileMode(task.Remote.Mode, false)
@@ -716,28 +743,21 @@ func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error 
 	if task.Remote.ModTime == 0 {
 		mtime = time.Now()
 	}
-	if err := replaceFile(tmp, abs, mode, mtime); err != nil {
+	if err := e.root.Chmod(tmp, mode); err != nil && !errors.Is(err, os.ErrPermission) {
 		return err
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	cur := e.idx.Files[task.Path]
-	if !unchanged(cur, task) {
-		return errStale
+	if err := e.root.Chtimes(tmp, mtime, mtime); err != nil {
+		return err
+	}
+	if err := e.root.Rename(tmp, task.Path); err != nil {
+		return err
 	}
 	e.idx.Files[task.Path] = &File{
-		Size:    task.Remote.Size,
-		ModTime: mtime.UnixNano(),
-		Mode:    uint32(mode),
-		Sum:     sum,
-		Blocks:  blocks,
-		Version: vclock.Clone(task.Version),
+		Size: task.Remote.Size, ModTime: mtime.UnixNano(), Mode: uint32(mode),
+		Sum: sum, Blocks: blocks, Version: vclock.Clone(task.Version),
 	}
 	e.idx.Seq++
-	if err := e.persistLocked(); err != nil {
-		return err
-	}
-	return nil
+	return e.persistLocked()
 }
 
 // Stats counts live files and directories.
@@ -848,47 +868,4 @@ func conflictName(rel, device string, now time.Time) string {
 		short = short[:8]
 	}
 	return base + ".sync-conflict-" + short + "-" + strconv.FormatInt(now.UnixMilli(), 10) + ext
-}
-
-func copyFile(src, dst string, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	if err := out.Sync(); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
-}
-
-func replaceFile(tmp, dest string, mode os.FileMode, mtime time.Time) error {
-	if err := os.Chmod(tmp, mode); err != nil && !errors.Is(err, os.ErrPermission) {
-		return err
-	}
-	if info, err := os.Lstat(dest); err == nil && info.IsDir() {
-		return errors.New("path is a directory")
-	}
-	// Unix rename replaces a file. Windows rename does not.
-	if runtime.GOOS == "windows" {
-		if err := os.Remove(dest); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	if err := os.Rename(tmp, dest); err != nil {
-		return err
-	}
-	return os.Chtimes(dest, mtime, mtime)
 }

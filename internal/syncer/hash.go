@@ -4,23 +4,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
-	"os"
 
 	"github.com/netcraft/peersync/internal/proto"
 )
 
-// HashFile splits a file into proto.BlockSize chunks and returns the hash of
-// the chunk hashes. An empty file has no chunks and sums to SHA-256 of nothing.
-func HashFile(path string) (sum [32]byte, blocks [][32]byte, size int64, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return sum, nil, 0, err
-	}
-	defer f.Close()
-	return HashReader(f)
-}
-
-// HashReader hashes r the same way HashFile does.
+// HashReader hashes a file as fixed-size blocks.
 func HashReader(r io.Reader) (sum [32]byte, blocks [][32]byte, size int64, err error) {
 	buf := make([]byte, proto.BlockSize)
 	for {
@@ -51,7 +39,7 @@ func SumBlocks(blocks [][32]byte) [32]byte {
 }
 
 // ReadBlock reads one chunk. The last chunk may be short.
-func ReadBlock(path string, index int, size int64) ([]byte, error) {
+func ReadBlock(r io.ReaderAt, index int, size int64) ([]byte, error) {
 	if index < 0 {
 		return nil, errors.New("bad block index")
 	}
@@ -63,13 +51,8 @@ func ReadBlock(path string, index int, size int64) ([]byte, error) {
 	if off+want > size {
 		want = size - off
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
 	buf := make([]byte, want)
-	_, err = f.ReadAt(buf, off)
+	_, err := r.ReadAt(buf, off)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}

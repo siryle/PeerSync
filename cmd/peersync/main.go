@@ -406,11 +406,11 @@ func cmdShareRm(args []string) {
 
 func applyEnv(home, serverFlag string) error {
 	path := filepath.Join(home, config.FileName)
-	cfg, _, err := config.Load(path)
+	cfg, exists, err := config.Load(path)
 	if err != nil {
 		return err
 	}
-	if name := os.Getenv("PEERSYNC_NAME"); name != "" && (cfg.DeviceName == "" || os.Getenv("PEERSYNC_NAME_FORCE") == "1") {
+	if name := os.Getenv("PEERSYNC_NAME"); name != "" && (!exists || cfg.DeviceName == "" || os.Getenv("PEERSYNC_NAME_FORCE") == "1") {
 		cfg.DeviceName = name
 	}
 	if serverFlag != "" {
