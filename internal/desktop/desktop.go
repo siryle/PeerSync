@@ -13,7 +13,7 @@ import (
 	"github.com/netcraft/peersync/internal/ui"
 )
 
-// Run opens the window and syncs until it closes.
+// Run serves the desktop UI and syncs until the native application exits.
 func Run() error {
 	if !Available() {
 		return errors.New("图形界面只在 macOS 和 Windows 上提供")

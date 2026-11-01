@@ -3,6 +3,7 @@ let selected = "";
 let lastKey = "";
 let modalOpen = false;
 let uiToken = "";
+let pendingDesktopAction = "";
 
 const hashToken = (location.hash || "").replace(/^#/, "");
 if (hashToken) {
@@ -234,6 +235,7 @@ function closeModal() {
   root.hidden = true;
   root.innerHTML = "";
   if (state) render();
+  applyDesktopAction();
 }
 
 function setBusy(btn, busy, label) {
@@ -546,8 +548,34 @@ async function refresh() {
     const pill = $("pill");
     pill.className = "pill bad";
     pill.innerHTML = '<i class="dot"></i>' + esc(err.message);
+  } finally {
+    applyDesktopAction();
   }
 }
+
+function applyDesktopAction() {
+  if (!state || modalOpen || !pendingDesktopAction) return;
+  const action = pendingDesktopAction;
+  pendingDesktopAction = "";
+  if (action === "settings") {
+    openDevice();
+  } else if (action === "logs") {
+    render();
+    const log = $("log") || $("log-empty");
+    if (log) {
+      log.scrollIntoView({ block: "center" });
+      log.tabIndex = -1;
+      log.focus({ preventScroll: true });
+    }
+  }
+}
+
+window.peerSyncDesktopAction = (action) => {
+  if (action !== "settings" && action !== "logs") return;
+  pendingDesktopAction = action;
+  if (!state) refresh();
+  else applyDesktopAction();
+};
 
 $("btn-new").onclick = openCreate;
 $("btn-join").onclick = openJoin;
