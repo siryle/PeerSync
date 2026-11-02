@@ -1,6 +1,7 @@
 package syncer
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,6 +36,14 @@ func BenchmarkIdleScan10k(b *testing.B) {
 			}
 		})
 	}
+	b.Run("file-event", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := e.scanContext(context.Background(), false, nil, "file-00000"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func BenchmarkIdleIndex200k(b *testing.B) {

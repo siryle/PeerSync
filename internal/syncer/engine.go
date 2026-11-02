@@ -219,30 +219,46 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 	}
 	ig := e.ignores()
 
-	next := func() time.Duration {
-		if until := time.Until(verified.Add(e.verifyEvery)); !verified.IsZero() && until > 0 && until < every {
-			return until
-		}
-		return every
-	}
-	timer := time.NewTimer(next())
+	// Polling keeps its own deadline even while file events keep arriving.
+	poll := time.NewTicker(min(every, e.verifyEvery))
+	defer poll.Stop()
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
 	defer timer.Stop()
-	pending := false
+	pending, whole := false, false
+	paths := map[string]bool{}
+	schedule := func() {
+		if !pending {
+			timer.Reset(300 * time.Millisecond)
+			pending = true
+		}
+	}
+	runScan := func(all bool) {
+		timer.Stop()
+		pending = false
+		full := verified.IsZero() || time.Since(verified) >= e.verifyEvery
+		var changed []string
+		if !all && !whole && !full {
+			for rel := range paths {
+				changed = append(changed, rel)
+			}
+		}
+		clear(paths)
+		whole = false
+		if err := e.scanContext(ctx, full, watcher, changed...); err != nil {
+			e.Log.Warn("scan", "err", err, "root", e.Root)
+		} else if full {
+			verified = time.Now()
+		}
+		ig = e.ignores()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-e.kick:
-			if !pending {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(300 * time.Millisecond)
-				pending = true
-			}
+			whole = true
+			schedule()
 		case event, ok := <-watcher.Events:
 			if !ok {
 				return nil
@@ -261,24 +277,25 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 				if ig.Match(rel, dir) {
 					continue
 				}
+				paths[rel] = true
 			}
-			e.Kick()
+			// kqueue may report only the containing directory; ignore changes
+			// and root events also need a complete walk.
+			if err != nil || rel == ".peersyncignore" || kqueueOS() {
+				whole = true
+			}
+			schedule()
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return nil
 			}
 			e.Log.Warn("watch", "err", err)
-			e.Kick()
+			whole = true
+			schedule()
+		case <-poll.C:
+			runScan(true)
 		case <-timer.C:
-			pending = false
-			full := verified.IsZero() || time.Since(verified) >= e.verifyEvery
-			if err := e.scanContext(ctx, full, watcher); err != nil {
-				e.Log.Warn("scan", "err", err, "root", e.Root)
-			} else if full {
-				verified = time.Now()
-			}
-			ig = e.ignores()
-			timer.Reset(next())
+			runScan(false)
 		}
 	}
 }
@@ -301,14 +318,48 @@ func (e *Engine) scan(full bool) error {
 	return e.scanContext(context.Background(), full, nil)
 }
 
-func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.Watcher) error {
+func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.Watcher, paths ...string) error {
 	started := time.Now()
+	scopes := make(map[string]bool, len(paths))
+	for _, rel := range paths {
+		if !ValidRel(rel) {
+			return errors.New("bad scan path")
+		}
+		scopes[rel] = true
+	}
+	paths = nil
+	for rel := range scopes {
+		covered := false
+		for parent := path.Dir(rel); parent != "."; parent = path.Dir(parent) {
+			if scopes[parent] {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			paths = append(paths, rel)
+		}
+	}
+	inScope := func(rel string) bool {
+		if len(paths) == 0 {
+			return true
+		}
+		for rel != "." {
+			if scopes[rel] {
+				return true
+			}
+			rel = path.Dir(rel)
+		}
+		return false
+	}
 	ig := e.ignores()
 	watched := map[string]bool{}
 	watchFailed := false
 	if watcher != nil {
 		for _, abs := range watcher.WatchList() {
-			watched[abs] = false
+			if rel, err := relOf(e.Root, abs); (err == nil && inScope(rel)) || (len(paths) == 0 && abs == e.Root) {
+				watched[abs] = false
+			}
 		}
 	}
 	watch := func(rel string) {
@@ -327,7 +378,9 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 			watched[abs] = true
 		}
 	}
-	watch(".")
+	if len(paths) == 0 {
+		watch(".")
+	}
 	type item struct {
 		rel   string
 		size  int64
@@ -340,11 +393,14 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 	// tombstoned: a failed listing is not evidence that the files are gone.
 	var unread []string
 	var rootErr error
-	err := fs.WalkDir(e.root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
+	walk := func(rel string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if err != nil {
+			if len(paths) > 0 && errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
 			if rel == "." {
 				rootErr = err
 				return filepath.SkipAll
@@ -400,12 +456,18 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 			dir:   info.IsDir(),
 		})
 		return nil
-	})
+	}
+	roots := paths
+	if len(roots) == 0 {
+		roots = []string{"."}
+	}
+	for _, root := range roots {
+		if err := fs.WalkDir(e.root.FS(), root, walk); err != nil {
+			return err
+		}
+	}
 	if rootErr != nil {
 		return fmt.Errorf("scan %s: %w", e.Root, rootErr)
-	}
-	if err != nil {
-		return err
 	}
 	for abs, seen := range watched {
 		rel, err := relOf(e.Root, abs)
@@ -423,10 +485,16 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 		deleted, dir bool
 		version      vclock.Vector
 	}
-	snap := make(map[string]snapshot, len(e.idx.Files))
+	size := len(e.idx.Files)
+	if len(paths) > 0 {
+		size = len(items)
+	}
+	snap := make(map[string]snapshot, size)
 	for k, v := range e.idx.Files {
-		// Index updates replace version maps instead of mutating them.
-		snap[k] = snapshot{v.Size, v.ModTime, len(v.Blocks), v.Deleted, v.IsDir, v.Version}
+		if inScope(k) {
+			// Index updates replace version maps instead of mutating them.
+			snap[k] = snapshot{v.Size, v.ModTime, len(v.Blocks), v.Deleted, v.IsDir, v.Version}
+		}
 	}
 	inflight := make(map[string]int, len(e.inflight))
 	for k, v := range e.inflight {
@@ -498,7 +566,7 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 		}
 	}
 	for rel, f := range e.idx.Files {
-		if seen[rel] || f.Deleted || e.inflight[rel] > 0 || unreadCovers(unread, rel) {
+		if !inScope(rel) || seen[rel] || f.Deleted || e.inflight[rel] > 0 || unreadCovers(unread, rel) {
 			continue
 		}
 		if ig.Match(rel, f.IsDir) {
@@ -524,7 +592,7 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 	if len(unread) > 0 {
 		return fmt.Errorf("scan incomplete, left %s unchanged", unread[0])
 	}
-	e.Log.Debug("scan complete", "root", e.Root, "full", full, "paths", len(items), "changed", changed, "elapsed", time.Since(started))
+	e.Log.Debug("scan complete", "root", e.Root, "full", full, "scoped", len(paths) > 0, "paths", len(items), "changed", changed, "elapsed", time.Since(started))
 	return nil
 }
 
