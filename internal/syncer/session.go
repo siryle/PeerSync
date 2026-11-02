@@ -12,6 +12,7 @@ import (
 	"github.com/netcraft/peersync/internal/config"
 	"github.com/netcraft/peersync/internal/frame"
 	"github.com/netcraft/peersync/internal/proto"
+	"github.com/netcraft/peersync/internal/vclock"
 )
 
 // Serve runs directory sync on an already authenticated connection until it
@@ -85,10 +86,11 @@ type session struct {
 }
 
 type indexAsm struct {
-	seq   uint64
-	total int
-	parts map[int][]proto.Entry
-	mode  config.SyncMode
+	seq    uint64
+	total  int
+	parts  map[int][]proto.Entry
+	mode   config.SyncMode
+	clocks vclock.Pool
 }
 
 type indexUpdate struct {
@@ -213,7 +215,7 @@ func (s *session) syncLoop(sub <-chan struct{}) error {
 func (s *session) sendIndex() error {
 	var entries []proto.Entry
 	if s.e.Mode != config.ReceiveOnly {
-		_, entries = s.e.Entries()
+		_, entries = s.e.entries(false)
 	}
 	const pageSize = 40
 	total := (len(entries) + pageSize - 1) / pageSize
@@ -255,11 +257,18 @@ func (s *session) onIndex(payload []byte) {
 	if s.asm.mode != config.SyncMode(page.Mode).Effective() {
 		return
 	}
+	for i := range page.Entries {
+		page.Entries[i].Version = s.asm.clocks.Intern(page.Entries[i].Version)
+	}
 	s.asm.parts[page.Part] = page.Entries
 	if len(s.asm.parts) < page.Total {
 		return
 	}
-	all := make([]proto.Entry, 0)
+	count := 0
+	for _, part := range s.asm.parts {
+		count += len(part)
+	}
+	all := make([]proto.Entry, 0, count)
 	for i := 0; i < page.Total; i++ {
 		part, ok := s.asm.parts[i]
 		if !ok {
@@ -268,6 +277,7 @@ func (s *session) onIndex(payload []byte) {
 		all = append(all, part...)
 	}
 	s.asm.parts = nil
+	s.asm.clocks = vclock.Pool{}
 	select {
 	case s.indexReady <- indexUpdate{entries: all, mode: s.asm.mode}:
 	default:

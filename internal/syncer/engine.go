@@ -3,7 +3,6 @@ package syncer
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,6 +58,7 @@ type Engine struct {
 
 	mu       sync.Mutex
 	idx      indexFile
+	clocks   vclock.Pool
 	inflight map[string]int
 	subs     []chan struct{}
 	kick     chan struct{}
@@ -135,25 +135,6 @@ func Open(root, indexPath, self string, log *slog.Logger, options ...Options) (*
 
 // Close releases the shared directory handle after its workers have stopped.
 func (e *Engine) Close() error { return e.root.Close() }
-
-func (e *Engine) load() error {
-	b, err := os.ReadFile(e.IndexPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	var idx indexFile
-	if err := json.Unmarshal(b, &idx); err != nil {
-		return err
-	}
-	if idx.Files == nil {
-		idx.Files = map[string]*File{}
-	}
-	e.idx = idx
-	return nil
-}
 
 // Ready is closed after the first scan that could read the share root.
 // Peers wait for it so a stale tombstone index is not announced first.
@@ -560,7 +541,7 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 		}
 		if cur != nil && !cur.Deleted && cur.Mode != it.mode {
 			cur.Mode = it.mode
-			cur.Version = vclock.Bump(cur.Version, e.Self)
+			cur.Version = e.clocks.Intern(vclock.Bump(cur.Version, e.Self))
 			cur.Local = e.Mode == config.ReceiveOnly
 			changed = true
 		}
@@ -578,7 +559,7 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 		f.Blocks = nil
 		f.Sum = [32]byte{}
 		f.Size = 0
-		f.Version = vclock.Bump(f.Version, e.Self)
+		f.Version = e.clocks.Intern(vclock.Bump(f.Version, e.Self))
 		f.Local = e.Mode == config.ReceiveOnly
 		changed = true
 	}
@@ -627,7 +608,7 @@ func (e *Engine) upsertDir(rel string, mode uint32) bool {
 			return false
 		}
 		prev.Mode = mode
-		prev.Version = vclock.Bump(prev.Version, e.Self)
+		prev.Version = e.clocks.Intern(vclock.Bump(prev.Version, e.Self))
 		prev.Local = e.Mode == config.ReceiveOnly
 		return true
 	}
@@ -635,7 +616,7 @@ func (e *Engine) upsertDir(rel string, mode uint32) bool {
 	if prev != nil {
 		ver = prev.Version
 	}
-	e.idx.Files[rel] = &File{IsDir: true, Mode: mode, Version: vclock.Bump(ver, e.Self), Local: e.Mode == config.ReceiveOnly}
+	e.idx.Files[rel] = &File{IsDir: true, Mode: mode, Version: e.clocks.Intern(vclock.Bump(ver, e.Self)), Local: e.Mode == config.ReceiveOnly}
 	return true
 }
 
@@ -654,7 +635,7 @@ func (e *Engine) upsertFile(rel string, size, mtime int64, mode uint32, sum [32]
 	}
 	e.idx.Files[rel] = &File{
 		Size: size, ModTime: mtime, Mode: mode,
-		Sum: sum, Blocks: blocks, Version: vclock.Bump(ver, e.Self),
+		Sum: sum, Blocks: blocks, Version: e.clocks.Intern(vclock.Bump(ver, e.Self)),
 		Local: e.Mode == config.ReceiveOnly,
 	}
 	return true
@@ -662,10 +643,19 @@ func (e *Engine) upsertFile(rel string, size, mtime int64, mode uint32, sum [32]
 
 // Entries is a snapshot of the index for announcement to peers.
 func (e *Engine) Entries() (uint64, []proto.Entry) {
+	return e.entries(true)
+}
+
+// Internal announcements share immutable versions instead of cloning every map.
+func (e *Engine) entries(cloneVersions bool) (uint64, []proto.Entry) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]proto.Entry, 0, len(e.idx.Files))
 	for p, f := range e.idx.Files {
+		version := f.Version
+		if cloneVersions {
+			version = vclock.Clone(version)
+		}
 		out = append(out, proto.Entry{
 			Path:    p,
 			Size:    f.Size,
@@ -674,7 +664,7 @@ func (e *Engine) Entries() (uint64, []proto.Entry) {
 			IsDir:   f.IsDir,
 			Deleted: f.Deleted,
 			Sum:     proto.EncodeSum(f.Sum, !f.Deleted && !f.IsDir),
-			Version: vclock.Clone(f.Version),
+			Version: version,
 		})
 	}
 	return e.idx.Seq, out
@@ -790,7 +780,7 @@ func (e *Engine) ApplyDelete(task Task) error {
 	if err := e.root.Remove(task.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	e.idx.Files[task.Path] = &File{Deleted: true, IsDir: task.Remote.IsDir, Version: vclock.Clone(task.Version)}
+	e.idx.Files[task.Path] = &File{Deleted: true, IsDir: task.Remote.IsDir, Version: e.clocks.Intern(task.Version)}
 	e.idx.Seq++
 	return e.persistLocked()
 }
@@ -816,7 +806,7 @@ func (e *Engine) ApplyMerge(task Task) error {
 			cur.ModTime = info.ModTime().UnixNano()
 		}
 	}
-	cur.Version = vclock.Clone(task.Version)
+	cur.Version = e.clocks.Intern(task.Version)
 	cur.Local = false
 	e.idx.Seq++
 	return e.persistLocked()
@@ -847,7 +837,7 @@ func (e *Engine) ApplyDir(task Task) error {
 	if err != nil {
 		return err
 	}
-	e.idx.Files[task.Path] = &File{IsDir: true, Mode: uint32(info.Mode().Perm()), Version: vclock.Clone(task.Version)}
+	e.idx.Files[task.Path] = &File{IsDir: true, Mode: uint32(info.Mode().Perm()), Version: e.clocks.Intern(task.Version)}
 	e.idx.Seq++
 	return e.persistLocked()
 }
@@ -911,7 +901,7 @@ func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error 
 	}
 	e.idx.Files[task.Path] = &File{
 		Size: task.Remote.Size, ModTime: info.ModTime().UnixNano(), Mode: uint32(info.Mode().Perm()),
-		Sum: sum, Blocks: blocks, Version: vclock.Clone(task.Version),
+		Sum: sum, Blocks: blocks, Version: e.clocks.Intern(task.Version),
 	}
 	e.idx.Seq++
 	return e.persistLocked()
@@ -981,21 +971,6 @@ func (e *Engine) persistLocked() error {
 	}
 	e.notify()
 	return nil
-}
-
-func (e *Engine) saveLocked() error {
-	if err := os.MkdirAll(filepath.Dir(e.IndexPath), 0o700); err != nil {
-		return err
-	}
-	b, err := json.Marshal(e.idx)
-	if err != nil {
-		return err
-	}
-	tmp := e.IndexPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, e.IndexPath)
 }
 
 func relOf(root, abs string) (string, error) {
