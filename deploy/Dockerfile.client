@@ -10,7 +10,9 @@ RUN apk add --no-cache ca-certificates
 COPY --from=build /out/peersync /usr/local/bin/peersync
 ENV PEERSYNC_HOME=/config \
     PEERSYNC_PATH=/sync \
-    PEERSYNC_UI=0.0.0.0:8384
+    PEERSYNC_UI=0.0.0.0:8384 \
+    PEERSYNC_SCAN_INTERVAL=5m \
+    PEERSYNC_VERIFY_INTERVAL=1h
 # The page listens on all interfaces. Set PEERSYNC_UI_TOKEN at run time.
 VOLUME ["/config", "/sync"]
 EXPOSE 42420/tcp 42420/udp 8384/tcp

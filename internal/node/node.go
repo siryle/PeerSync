@@ -35,6 +35,7 @@ type Options struct {
 	ListenPort   int
 	RandomListen bool
 	ScanEvery    time.Duration
+	VerifyEvery  time.Duration
 	Log          *slog.Logger
 }
 
@@ -274,7 +275,7 @@ func (n *Node) addShare(sh config.Share) error {
 		return err
 	}
 	eng, err := syncer.Open(abs, config.IndexPath(n.home, sh.ShareID), n.id.DeviceID(), n.log,
-		syncer.Options{Mode: sh.Mode, SourceID: sh.SourceID})
+		syncer.Options{Mode: sh.Mode, SourceID: sh.SourceID, VerifyEvery: n.opt.VerifyEvery})
 	if err != nil {
 		return err
 	}

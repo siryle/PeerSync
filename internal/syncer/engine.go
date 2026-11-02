@@ -48,13 +48,14 @@ type indexFile struct {
 
 // Engine tracks one shared directory and applies peer updates.
 type Engine struct {
-	Root      string
-	IndexPath string
-	Self      string
-	Log       *slog.Logger
-	root      *os.Root
-	Mode      config.SyncMode
-	SourceID  string
+	Root        string
+	IndexPath   string
+	Self        string
+	Log         *slog.Logger
+	root        *os.Root
+	Mode        config.SyncMode
+	SourceID    string
+	verifyEvery time.Duration
 
 	mu       sync.Mutex
 	idx      indexFile
@@ -63,16 +64,20 @@ type Engine struct {
 	kick     chan struct{}
 	// batch coalesces index writes. A reconcile used to rewrite the whole
 	// index once per file, which dominated syncing a large tree.
-	batch int
-	dirty bool
+	batch      int
+	dirty      bool
+	statsSeq   uint64
+	statsFiles int
+	statsValid bool
 
 	ready     chan struct{}
 	readyOnce sync.Once
 }
 
 type Options struct {
-	Mode     config.SyncMode
-	SourceID string
+	Mode        config.SyncMode
+	SourceID    string
+	VerifyEvery time.Duration
 }
 
 // Open loads an index. A missing or corrupt index starts empty; the next
@@ -93,6 +98,12 @@ func Open(root, indexPath, self string, log *slog.Logger, options ...Options) (*
 	if err := config.ValidateSync(opt.Mode, opt.SourceID); err != nil {
 		return nil, err
 	}
+	if opt.VerifyEvery < 0 {
+		return nil, errors.New("verification interval must be positive")
+	}
+	if opt.VerifyEvery == 0 {
+		opt.VerifyEvery = 5 * time.Minute
+	}
 	if err := CheckConflictLocation(abs, indexPath); err != nil {
 		return nil, err
 	}
@@ -101,17 +112,18 @@ func Open(root, indexPath, self string, log *slog.Logger, options ...Options) (*
 		return nil, err
 	}
 	e := &Engine{
-		Root:      abs,
-		root:      dir,
-		IndexPath: indexPath,
-		Self:      self,
-		Log:       log,
-		inflight:  map[string]int{},
-		kick:      make(chan struct{}, 1),
-		idx:       indexFile{Files: map[string]*File{}},
-		ready:     make(chan struct{}),
-		Mode:      opt.Mode.Effective(),
-		SourceID:  opt.SourceID,
+		Root:        abs,
+		root:        dir,
+		IndexPath:   indexPath,
+		Self:        self,
+		Log:         log,
+		inflight:    map[string]int{},
+		kick:        make(chan struct{}, 1),
+		idx:         indexFile{Files: map[string]*File{}},
+		ready:       make(chan struct{}),
+		Mode:        opt.Mode.Effective(),
+		SourceID:    opt.SourceID,
+		verifyEvery: opt.VerifyEvery,
 	}
 	if err := e.load(); err != nil {
 		e.Log.Warn("index unreadable, scanning as a new folder", "err", err, "path", indexPath)
@@ -193,77 +205,82 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 	if every <= 0 {
 		every = 20 * time.Second
 	}
-	if err := e.Scan(); err != nil {
-		e.Log.Warn("scan", "err", err, "root", e.Root)
-	}
-	verified := time.Now()
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
 	}
 	defer watcher.Close()
-	e.watchAll(watcher)
+	e.Log.Info("scan intervals", "root", e.Root, "scan_every", every, "verify_every", e.verifyEvery)
+	verified := time.Time{}
+	if err := e.scanContext(ctx, true, watcher); err != nil {
+		e.Log.Warn("scan", "err", err, "root", e.Root)
+	} else {
+		verified = time.Now()
+	}
+	ig := e.ignores()
 
-	timer := time.NewTimer(every)
+	next := func() time.Duration {
+		if until := time.Until(verified.Add(e.verifyEvery)); !verified.IsZero() && until > 0 && until < every {
+			return until
+		}
+		return every
+	}
+	timer := time.NewTimer(next())
 	defer timer.Stop()
+	pending := false
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-e.kick:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
+			if !pending {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
 				}
+				timer.Reset(300 * time.Millisecond)
+				pending = true
 			}
-			timer.Reset(300 * time.Millisecond)
-		case _, ok := <-watcher.Events:
+		case event, ok := <-watcher.Events:
 			if !ok {
 				return nil
+			}
+			rel, err := relOf(e.Root, event.Name)
+			if err == nil {
+				info, statErr := e.root.Lstat(rel)
+				dir := statErr == nil && info.IsDir()
+				if statErr != nil {
+					e.mu.Lock()
+					if f := e.idx.Files[rel]; f != nil {
+						dir = f.IsDir
+					}
+					e.mu.Unlock()
+				}
+				if ig.Match(rel, dir) {
+					continue
+				}
 			}
 			e.Kick()
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return nil
 			}
-			e.Log.Debug("watch", "err", err)
+			e.Log.Warn("watch", "err", err)
+			e.Kick()
 		case <-timer.C:
-			// Periodically verify bytes even when a writer preserved size and mtime.
-			full := time.Since(verified) >= 5*time.Minute
-			if err := e.scan(full); err != nil {
+			pending = false
+			full := verified.IsZero() || time.Since(verified) >= e.verifyEvery
+			if err := e.scanContext(ctx, full, watcher); err != nil {
 				e.Log.Warn("scan", "err", err, "root", e.Root)
 			} else if full {
 				verified = time.Now()
 			}
-			e.watchAll(watcher)
-			timer.Reset(every)
+			ig = e.ignores()
+			timer.Reset(next())
 		}
 	}
-}
-
-func (e *Engine) watchAll(w *fsnotify.Watcher) {
-	_ = w.Add(e.Root)
-	// kqueue opens one descriptor per file inside each watched directory.
-	// A large tree (this share has held ~200k files) exhausts the process
-	// limit. The next scan then cannot read the folder; treating that as
-	// deletion wipes the index and the peer. Nested edits are picked up
-	// by the periodic scan instead.
-	if kqueueOS() {
-		return
-	}
-	ig := e.ignores()
-	_ = filepath.WalkDir(e.Root, func(abs string, d fs.DirEntry, err error) error {
-		if err != nil || d == nil || !d.IsDir() || abs == e.Root {
-			return nil
-		}
-		rel, err := relOf(e.Root, abs)
-		if err != nil || ig.Match(rel, true) {
-			return filepath.SkipDir
-		}
-		_ = w.Add(abs)
-		return nil
-	})
 }
 
 func kqueueOS() bool {
@@ -281,7 +298,36 @@ func (e *Engine) Scan() error {
 }
 
 func (e *Engine) scan(full bool) error {
+	return e.scanContext(context.Background(), full, nil)
+}
+
+func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.Watcher) error {
+	started := time.Now()
 	ig := e.ignores()
+	watched := map[string]bool{}
+	watchFailed := false
+	if watcher != nil {
+		for _, abs := range watcher.WatchList() {
+			watched[abs] = false
+		}
+	}
+	watch := func(rel string) {
+		if watcher == nil || (rel != "." && kqueueOS()) {
+			return
+		}
+		abs := filepath.Join(e.Root, filepath.FromSlash(rel))
+		if _, exists := watched[abs]; exists {
+			watched[abs] = true
+		} else if err := watcher.Add(abs); err != nil {
+			if !watchFailed {
+				e.Log.Warn("watch directory; periodic scans remain enabled", "path", abs, "err", err)
+				watchFailed = true
+			}
+		} else {
+			watched[abs] = true
+		}
+	}
+	watch(".")
 	type item struct {
 		rel   string
 		size  int64
@@ -295,6 +341,9 @@ func (e *Engine) scan(full bool) error {
 	var unread []string
 	var rootErr error
 	err := fs.WalkDir(e.root.FS(), ".", func(rel string, d fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err != nil {
 			if rel == "." {
 				rootErr = err
@@ -340,6 +389,9 @@ func (e *Engine) scan(full bool) error {
 		if !info.IsDir() && !info.Mode().IsRegular() {
 			return nil
 		}
+		if info.IsDir() {
+			watch(rel)
+		}
 		items = append(items, item{
 			rel:   rel,
 			size:  info.Size(),
@@ -355,13 +407,26 @@ func (e *Engine) scan(full bool) error {
 	if err != nil {
 		return err
 	}
+	for abs, seen := range watched {
+		rel, err := relOf(e.Root, abs)
+		if !seen && err == nil && !unreadCovers(unread, rel) {
+			if err := watcher.Remove(abs); err != nil && !errors.Is(err, fsnotify.ErrNonExistentWatch) {
+				e.Log.Debug("remove watch", "path", abs, "err", err)
+			}
+		}
+	}
 
 	e.mu.Lock()
-	snap := make(map[string]*File, len(e.idx.Files))
+	type snapshot struct {
+		size, mtime  int64
+		blocks       int
+		deleted, dir bool
+		version      vclock.Vector
+	}
+	snap := make(map[string]snapshot, len(e.idx.Files))
 	for k, v := range e.idx.Files {
-		cp := *v
-		cp.Version = vclock.Clone(v.Version)
-		snap[k] = &cp
+		// Index updates replace version maps instead of mutating them.
+		snap[k] = snapshot{v.Size, v.ModTime, len(v.Blocks), v.Deleted, v.IsDir, v.Version}
 	}
 	inflight := make(map[string]int, len(e.inflight))
 	for k, v := range e.inflight {
@@ -376,11 +441,14 @@ func (e *Engine) scan(full bool) error {
 	}
 	hashes := map[string]hashed{}
 	for _, it := range items {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if it.dir || inflight[it.rel] > 0 {
 			continue
 		}
-		prev := snap[it.rel]
-		if !full && prev != nil && !prev.Deleted && !prev.IsDir && prev.Size == it.size && prev.ModTime == it.mtime && len(prev.Blocks) == BlocksForSize(it.size) {
+		prev, exists := snap[it.rel]
+		if !full && exists && !prev.deleted && !prev.dir && prev.size == it.size && prev.mtime == it.mtime && prev.blocks == BlocksForSize(it.size) {
 			continue
 		}
 		sum, blocks, size, err := e.hashFile(it.rel)
@@ -393,6 +461,9 @@ func (e *Engine) scan(full bool) error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	changed := false
 	seen := map[string]bool{}
 	for _, it := range items {
@@ -401,7 +472,9 @@ func (e *Engine) scan(full bool) error {
 			continue
 		}
 		seen[it.rel] = true
-		if cur, prev := e.idx.Files[it.rel], snap[it.rel]; (cur == nil) != (prev == nil) || (cur != nil && vclock.Compare(cur.Version, prev.Version) != 0) {
+		cur := e.idx.Files[it.rel]
+		prev, exists := snap[it.rel]
+		if (cur != nil) != exists || (cur != nil && vclock.Compare(cur.Version, prev.version) != 0) {
 			e.Kick()
 			continue
 		}
@@ -417,11 +490,10 @@ func (e *Engine) scan(full bool) error {
 			}
 			continue
 		}
-		prev := e.idx.Files[it.rel]
-		if prev != nil && !prev.Deleted && prev.Mode != it.mode {
-			prev.Mode = it.mode
-			prev.Version = vclock.Bump(prev.Version, e.Self)
-			prev.Local = e.Mode == config.ReceiveOnly
+		if cur != nil && !cur.Deleted && cur.Mode != it.mode {
+			cur.Mode = it.mode
+			cur.Version = vclock.Bump(cur.Version, e.Self)
+			cur.Local = e.Mode == config.ReceiveOnly
 			changed = true
 		}
 	}
@@ -452,6 +524,7 @@ func (e *Engine) scan(full bool) error {
 	if len(unread) > 0 {
 		return fmt.Errorf("scan incomplete, left %s unchanged", unread[0])
 	}
+	e.Log.Debug("scan complete", "root", e.Root, "full", full, "paths", len(items), "changed", changed, "elapsed", time.Since(started))
 	return nil
 }
 
@@ -554,20 +627,16 @@ func (e *Engine) Plan(remote []proto.Entry) []Task {
 			filtered = append(filtered, entry)
 		}
 	}
-	local := make(map[string]*File, len(e.idx.Files))
-	for k, v := range e.idx.Files {
-		if ig.Match(k, v.IsDir) {
-			continue
-		}
-		cp := *v
-		cp.Version = vclock.Clone(v.Version)
-		cp.Blocks = nil
-		local[k] = &cp
-	}
 	if e.Mode == config.ReceiveOnly {
+		local := make(map[string]*File, len(e.idx.Files))
+		for k, v := range e.idx.Files {
+			if !ig.Match(k, v.IsDir) {
+				local[k] = v
+			}
+		}
 		return planReceive(local, filtered)
 	}
-	return Plan(e.Self, local, filtered)
+	return Plan(e.Self, e.idx.Files, filtered)
 }
 
 // Meta returns the block list of a non-deleted file.
@@ -784,12 +853,16 @@ func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error 
 func (e *Engine) Stats() (files int, seq uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for _, f := range e.idx.Files {
-		if !f.Deleted {
-			files++
+	if !e.statsValid || e.statsSeq != e.idx.Seq {
+		e.statsFiles = 0
+		for _, f := range e.idx.Files {
+			if !f.Deleted {
+				e.statsFiles++
+			}
 		}
+		e.statsSeq, e.statsValid = e.idx.Seq, true
 	}
-	return files, e.idx.Seq
+	return e.statsFiles, e.idx.Seq
 }
 
 func unchanged(cur *File, task Task) bool {

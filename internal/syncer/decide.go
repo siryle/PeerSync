@@ -51,6 +51,13 @@ func Plan(self string, local map[string]*File, remote []proto.Entry) []Task {
 }
 
 func decide(self string, local *File, r proto.Entry) []Task {
+	order := -1
+	if local != nil {
+		order = vclock.Compare(local.Version, r.Version)
+		if order == 0 || order == 1 {
+			return nil
+		}
+	}
 	base := Task{Path: r.Path, Remote: r, Version: vclock.Clone(r.Version)}
 	if local == nil {
 		if r.Deleted {
@@ -66,9 +73,7 @@ func decide(self string, local *File, r proto.Entry) []Task {
 	}
 	base.Had = true
 	base.Seen = vclock.Clone(local.Version)
-	switch vclock.Compare(local.Version, r.Version) {
-	case 0, 1:
-		return nil
+	switch order {
 	case -1:
 		if !local.Deleted && !r.Deleted && !local.IsDir && !r.IsDir && sameSum(local.Sum, r.Sum) {
 			base.Op = opMerge

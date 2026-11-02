@@ -4,18 +4,25 @@ import (
 	"crypto/sha256"
 	"errors"
 	"io"
+	"sync"
 
 	"github.com/netcraft/peersync/internal/proto"
 )
 
+var hashBuffers = sync.Pool{New: func() any {
+	buf := make([]byte, proto.BlockSize)
+	return &buf
+}}
+
 // HashReader hashes a file as fixed-size blocks.
 func HashReader(r io.Reader) (sum [32]byte, blocks [][32]byte, size int64, err error) {
-	buf := make([]byte, proto.BlockSize)
+	buf := hashBuffers.Get().(*[]byte)
+	defer hashBuffers.Put(buf)
 	for {
-		n, rerr := io.ReadFull(r, buf)
+		n, rerr := io.ReadFull(r, *buf)
 		if n > 0 {
 			size += int64(n)
-			blocks = append(blocks, sha256.Sum256(buf[:n]))
+			blocks = append(blocks, sha256.Sum256((*buf)[:n]))
 		}
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
 			break

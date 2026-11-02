@@ -28,3 +28,25 @@ func TestCompare(t *testing.T) {
 		t.Fatal("bump must not mutate the input")
 	}
 }
+
+func TestCompareMissingAndZero(t *testing.T) {
+	for _, tc := range []struct {
+		a, b Vector
+		want int
+	}{
+		{nil, Vector{"A": 0}, 0},
+		{Vector{"A": 0}, nil, 0},
+		{nil, Vector{"A": 1}, -1},
+		{Vector{"A": 1}, nil, 1},
+		{Vector{"A": 1}, Vector{"B": 1}, 2},
+		{Vector{"A": 1, "B": 0}, Vector{"A": 2}, -1},
+	} {
+		if got := Compare(tc.a, tc.b); got != tc.want {
+			t.Fatalf("Compare(%v, %v) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+	a, b := Vector{"A": 1, "B": 2}, Vector{"A": 2, "B": 1}
+	if allocs := testing.AllocsPerRun(100, func() { Compare(a, b) }); allocs != 0 {
+		t.Fatalf("version comparison allocated %v times", allocs)
+	}
+}

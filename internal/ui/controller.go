@@ -26,10 +26,12 @@ var ErrCancelled = errors.New("cancelled")
 
 // Controller edits the on-disk config and starts or stops the sync engine.
 type Controller struct {
-	home     string
-	log      *slog.Logger
-	deviceID string
-	pick     func() (string, error)
+	home        string
+	log         *slog.Logger
+	deviceID    string
+	pick        func() (string, error)
+	scanEvery   time.Duration
+	verifyEvery time.Duration
 
 	opMu    sync.Mutex
 	mu      sync.Mutex
@@ -43,6 +45,10 @@ type Controller struct {
 func NewController(home string, log *slog.Logger) (*Controller, error) {
 	if log == nil {
 		log = slog.Default()
+	}
+	scanEvery, verifyEvery, err := config.ScanIntervals()
+	if err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		return nil, err
@@ -61,7 +67,10 @@ func NewController(home string, log *slog.Logger) (*Controller, error) {
 			return nil, err
 		}
 	}
-	return &Controller{home: home, log: log, deviceID: id.DeviceID()}, nil
+	return &Controller{
+		home: home, log: log, deviceID: id.DeviceID(),
+		scanEvery: scanEvery, verifyEvery: verifyEvery,
+	}, nil
 }
 
 // SetPicker installs the native folder dialog. Tests leave it unset.
@@ -227,7 +236,9 @@ func (c *Controller) start() {
 	log := c.log
 	c.mu.Unlock()
 	go func() {
-		err := node.Run(ctx, node.Options{Home: home, Log: log})
+		err := node.Run(ctx, node.Options{
+			Home: home, Log: log, ScanEvery: c.scanEvery, VerifyEvery: c.verifyEvery,
+		})
 		c.mu.Lock()
 		c.running = false
 		c.cancel = nil

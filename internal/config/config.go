@@ -5,10 +5,12 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // FileName is the config file inside the home directory.
@@ -16,6 +18,29 @@ const FileName = "config.json"
 
 // IdentityFile is the device key file inside the home directory.
 const IdentityFile = "identity.json"
+
+// ScanIntervals returns polling and content-verification intervals.
+func ScanIntervals() (scan, verify time.Duration, err error) {
+	scan, verify = 20*time.Second, 5*time.Minute
+	for _, setting := range []struct {
+		name  string
+		value *time.Duration
+	}{
+		{"PEERSYNC_SCAN_INTERVAL", &scan},
+		{"PEERSYNC_VERIFY_INTERVAL", &verify},
+	} {
+		text := strings.TrimSpace(os.Getenv(setting.name))
+		if text == "" {
+			continue
+		}
+		value, parseErr := time.ParseDuration(text)
+		if parseErr != nil || value <= 0 {
+			return 0, 0, fmt.Errorf("%s must be a positive duration, for example 5m or 1h", setting.name)
+		}
+		*setting.value = value
+	}
+	return scan, verify, nil
+}
 
 // Config is the client configuration.
 type Config struct {

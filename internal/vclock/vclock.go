@@ -22,19 +22,17 @@ func Clone(v Vector) Vector {
 //   - 2 when each has an edit the other has not seen (concurrent)
 func Compare(a, b Vector) int {
 	less, greater := false, false
-	seen := make(map[string]struct{}, len(a)+len(b))
-	for k := range a {
-		seen[k] = struct{}{}
-	}
-	for k := range b {
-		seen[k] = struct{}{}
-	}
-	for k := range seen {
-		av, bv := a[k], b[k]
+	for k, av := range a {
+		bv := b[k]
 		if av < bv {
 			less = true
 		} else if av > bv {
 			greater = true
+		}
+	}
+	for k, bv := range b {
+		if _, ok := a[k]; !ok && bv > 0 {
+			less = true
 		}
 	}
 	switch {
