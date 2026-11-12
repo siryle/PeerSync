@@ -36,6 +36,7 @@ jobs:
       - run: go test ./...
 
   images:
+    if: github.ref_type == 'tag'
     needs: test
     runs-on: ubuntu-latest
     permissions:
@@ -107,6 +108,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=peersync-client
 
   windows:
+    if: github.ref_type == 'tag'
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -135,6 +137,7 @@ jobs:
           if-no-files-found: error
 
   macos:
+    if: github.ref_type == 'tag'
     needs: test
     runs-on: macos-15
     steps:
@@ -163,6 +166,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: github.ref_type == 'tag'
     needs: [images, windows, macos]
     runs-on: ubuntu-latest
     permissions:

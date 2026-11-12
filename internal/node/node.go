@@ -454,7 +454,7 @@ func (n *Node) readUDP() {
 			}
 			continue
 		}
-		from, to, ok := parsePunch(p)
+		from, to, ok := parsePunch(p, time.Now())
 		if !ok || !to.Equal(n.id.Public) {
 			continue
 		}
@@ -472,6 +472,9 @@ func (n *Node) notePunch(from ed25519.PublicKey, addr net.Addr) {
 			continue
 		}
 		if !contains(st.punched, hp) {
+			if len(st.punched) >= 8 {
+				st.punched = append(st.punched[:0], st.punched[1:]...)
+			}
 			st.punched = append(st.punched, hp)
 			n.log.Debug("udp punch", "peer", id, "addr", hp)
 		}

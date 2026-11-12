@@ -406,3 +406,94 @@ func (e *Engine) RestoreConflict(id, expected string) error {
 	e.idx.Seq++
 	return e.persistLocked()
 }
+
+// backupIncomingLocked keeps an incoming file whose name only differs by case
+// from a local file. On a case-insensitive filesystem writing it would
+// overwrite that local file, so the bytes are saved as a conflict backup.
+func (e *Engine) backupIncomingLocked(task Task, tmp string) error {
+	remoteSum, ok := proto.DecodeSum(task.Remote.Sum)
+	if !ok {
+		return errors.New("bad remote checksum")
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(task.Path + "\x00"))
+	_, _ = h.Write(remoteSum[:])
+	id := hex.EncodeToString(h.Sum(nil))
+	if c, f, err := OpenConflict(e.IndexPath, id); err == nil {
+		sum, _, size, hashErr := HashReader(f)
+		_ = f.Close()
+		if hashErr == nil && c.Path == task.Path && sum == remoteSum && size == task.Remote.Size {
+			return nil
+		}
+		return errors.New("existing backup failed verification")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(ConflictDir(e.IndexPath), 0o700); err != nil {
+		return err
+	}
+	dir, err := os.OpenRoot(ConflictDir(e.IndexPath))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	in, err := e.root.OpenFile(tmp, readFileFlags, 0)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := dir.OpenFile(id+".data", os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, in)
+	if err == nil {
+		err = out.Sync()
+	}
+	if err != nil {
+		_ = out.Close()
+		_ = dir.Remove(id + ".data")
+		return err
+	}
+	if _, err = out.Seek(0, io.SeekStart); err != nil {
+		_ = out.Close()
+		_ = dir.Remove(id + ".data")
+		return err
+	}
+	var sum [32]byte
+	var size int64
+	sum, _, size, err = HashReader(out)
+	closeErr := out.Close()
+	if err != nil || closeErr != nil || sum != remoteSum || size != task.Remote.Size {
+		_ = dir.Remove(id + ".data")
+		if err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		return errors.New("incoming backup failed verification")
+	}
+	c := Conflict{
+		ID: id, Path: task.Path, CreatedAt: time.Now().UTC(),
+		Size: size, ModTime: task.Remote.ModTime, Mode: task.Remote.Mode,
+		Sum: proto.EncodeSum(sum, true),
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	meta, err := dir.OpenFile(id+".json.tmp", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = meta.Write(b)
+	if err == nil {
+		err = meta.Sync()
+	}
+	err = errors.Join(err, meta.Close())
+	if err != nil {
+		return err
+	}
+	return dir.Rename(id+".json.tmp", id+".json")
+}

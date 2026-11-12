@@ -11,7 +11,7 @@ services:
       - "3478:3478/udp"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "wget", "-q", "--no-check-certificate", "-O", "-", "https://127.0.0.1:8080/health"]
       interval: 10s
       timeout: 3s
       retries: 3

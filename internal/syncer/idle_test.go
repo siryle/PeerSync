@@ -50,9 +50,6 @@ func TestScanUpdatesWatchesWhenIgnoreRulesChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := 2
-	if kqueueOS() {
-		want = 1
-	}
 	if n := len(w.WatchList()); n != want {
 		t.Fatalf("watched %d directories, want %d", n, want)
 	}
@@ -111,12 +108,10 @@ func TestRunFiltersIgnoredFileEvents(t *testing.T) {
 	if _, _, _, err := e.Meta("cache"); err != nil {
 		t.Fatalf("directory ignore hid a regular file: %v", err)
 	}
-	if !kqueueOS() {
-		putFile(t, filepath.Join(e.Root, "nested", "note.txt"), "first")
-		await()
-		putFile(t, filepath.Join(e.Root, "nested", "note.txt"), "second")
-		await()
-	}
+	putFile(t, filepath.Join(e.Root, "nested", "note.txt"), "first")
+	await()
+	putFile(t, filepath.Join(e.Root, "nested", "note.txt"), "second")
+	await()
 }
 
 func TestRunVerificationDeadlineIsIndependentOfPolling(t *testing.T) {
@@ -251,9 +246,6 @@ func TestRunPollingIsNotDelayedByPendingEvents(t *testing.T) {
 }
 
 func TestRunFileEventScansOnlyChangedPath(t *testing.T) {
-	if kqueueOS() {
-		t.Skip("kqueue uses complete scans for directory events")
-	}
 	e := testEngine(t, "A")
 	putFile(t, filepath.Join(e.Root, "a.txt"), "old")
 	putFile(t, filepath.Join(e.Root, "other.txt"), "unrelated")

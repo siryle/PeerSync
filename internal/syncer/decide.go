@@ -26,6 +26,7 @@ type Task struct {
 	Had      bool
 	Metadata bool // Apply the remote attributes along with the merged version.
 	Backup   bool // Preserve a receive-only local edit before replacing it.
+	Hold     bool // Keep incoming bytes as a conflict backup, not on disk.
 	Remote   proto.Entry
 }
 
@@ -161,8 +162,17 @@ func sameSum(local [32]byte, remoteHex string) bool {
 	return bytes.Equal(local[:], raw[:])
 }
 
-func planReceive(local map[string]*File, remote []proto.Entry) []Task {
+func planReceive(local map[string]*File, remote []proto.Entry, caseFold bool) []Task {
 	seen := make(map[string]bool, len(remote))
+	var remoteFold map[string]bool
+	if caseFold {
+		remoteFold = make(map[string]bool, len(remote))
+		for _, r := range remote {
+			if !r.Deleted {
+				remoteFold[foldKey(r.Path)] = true
+			}
+		}
+	}
 	var tasks []Task
 	for _, r := range remote {
 		if !ValidRel(r.Path) {
@@ -197,6 +207,9 @@ func planReceive(local map[string]*File, remote []proto.Entry) []Task {
 	}
 	for p, cur := range local {
 		if seen[p] || cur.Deleted {
+			continue
+		}
+		if remoteFold != nil && remoteFold[foldKey(p)] {
 			continue
 		}
 		tasks = append(tasks, Task{

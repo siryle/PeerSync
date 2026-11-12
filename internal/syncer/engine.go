@@ -11,7 +11,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -56,12 +55,13 @@ type Engine struct {
 	SourceID    string
 	verifyEvery time.Duration
 
-	mu       sync.Mutex
-	idx      indexFile
-	clocks   vclock.Pool
-	inflight map[string]int
-	subs     []chan struct{}
-	kick     chan struct{}
+	mu        sync.Mutex
+	persistMu sync.Mutex
+	idx       indexFile
+	clocks    vclock.Pool
+	inflight  map[string]int
+	subs      []chan struct{}
+	kick      chan struct{}
 	// batch coalesces index writes. A reconcile used to rewrite the whole
 	// index once per file, which dominated syncing a large tree.
 	batch      int
@@ -69,6 +69,7 @@ type Engine struct {
 	statsSeq   uint64
 	statsFiles int
 	statsValid bool
+	caseFold   bool
 
 	ready     chan struct{}
 	readyOnce sync.Once
@@ -129,6 +130,7 @@ func Open(root, indexPath, self string, log *slog.Logger, options ...Options) (*
 		e.Log.Warn("index unreadable, scanning as a new folder", "err", err, "path", indexPath)
 		e.idx = indexFile{Files: map[string]*File{}}
 	}
+	e.caseFold = foldsCase(abs)
 	_ = dir.RemoveAll(tmpDirName)
 	return e, nil
 }
@@ -260,9 +262,8 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 				}
 				paths[rel] = true
 			}
-			// kqueue may report only the containing directory; ignore changes
-			// and root events also need a complete walk.
-			if err != nil || rel == ".peersyncignore" || kqueueOS() {
+			// Root events and ignore-rule changes still need a complete walk.
+			if err != nil || rel == ".peersyncignore" {
 				whole = true
 			}
 			schedule()
@@ -278,15 +279,6 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 		case <-timer.C:
 			runScan(false)
 		}
-	}
-}
-
-func kqueueOS() bool {
-	switch runtime.GOOS {
-	case "darwin", "freebsd", "openbsd", "netbsd", "dragonfly":
-		return true
-	default:
-		return false
 	}
 }
 
@@ -344,7 +336,7 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 		}
 	}
 	watch := func(rel string) {
-		if watcher == nil || (rel != "." && kqueueOS()) {
+		if watcher == nil {
 			return
 		}
 		abs := filepath.Join(e.Root, filepath.FromSlash(rel))
@@ -546,8 +538,18 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 			changed = true
 		}
 	}
+	var foldSeen map[string]bool
+	if e.caseFold {
+		foldSeen = make(map[string]bool, len(seen))
+		for rel := range seen {
+			foldSeen[foldKey(rel)] = true
+		}
+	}
 	for rel, f := range e.idx.Files {
 		if !inScope(rel) || seen[rel] || f.Deleted || e.inflight[rel] > 0 || unreadCovers(unread, rel) {
+			continue
+		}
+		if foldSeen != nil && foldSeen[foldKey(rel)] {
 			continue
 		}
 		if ig.Match(rel, f.IsDir) {
@@ -678,13 +680,22 @@ func (e *Engine) Plan(remote []proto.Entry) []Task {
 	ig := e.ignores()
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	owners := e.foldOwners()
 	filtered := make([]proto.Entry, 0, len(remote))
+	var holds []Task
 	for _, entry := range remote {
+		if owner, ok := owners[foldKey(entry.Path)]; ok && owner != entry.Path {
+			if !entry.IsDir && !entry.Deleted {
+				holds = append(holds, Task{Op: opPull, Path: entry.Path, Remote: entry, Version: vclock.Clone(entry.Version), Hold: true})
+			}
+			continue
+		}
 		cur := e.idx.Files[entry.Path]
 		if !ig.Match(entry.Path, entry.IsDir || (cur != nil && cur.IsDir)) {
 			filtered = append(filtered, entry)
 		}
 	}
+	var tasks []Task
 	if e.Mode == config.ReceiveOnly {
 		local := make(map[string]*File, len(e.idx.Files))
 		for k, v := range e.idx.Files {
@@ -692,9 +703,11 @@ func (e *Engine) Plan(remote []proto.Entry) []Task {
 				local[k] = v
 			}
 		}
-		return planReceive(local, filtered)
+		tasks = planReceive(local, filtered, e.caseFold)
+	} else {
+		tasks = Plan(e.Self, e.idx.Files, filtered)
 	}
-	return Plan(e.Self, e.idx.Files, filtered)
+	return append(holds, tasks...)
 }
 
 // Meta returns the block list of a non-deleted file.
@@ -778,7 +791,12 @@ func (e *Engine) ApplyDelete(task Task) error {
 		}
 	}
 	if err := e.root.Remove(task.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+		if info, statErr := e.root.Lstat(task.Path); statErr == nil && info.IsDir() && e.removeIgnoredLeftovers(task.Path) {
+			err = nil
+		}
+		if err != nil {
+			return err
+		}
 	}
 	e.idx.Files[task.Path] = &File{Deleted: true, IsDir: task.Remote.IsDir, Version: e.clocks.Intern(task.Version)}
 	e.idx.Seq++
@@ -865,6 +883,9 @@ func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error 
 	tmp = filepath.ToSlash(tmp)
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if task.Hold {
+		return e.backupIncomingLocked(task, tmp)
+	}
 	if err := e.checkLocalLocked(task); err != nil {
 		return err
 	}
@@ -952,12 +973,10 @@ func (e *Engine) EndBatch() {
 		return
 	}
 	e.dirty = false
-	if err := e.saveLocked(); err != nil {
+	if err := e.persistLocked(); err != nil {
 		e.dirty = true
 		e.Log.Warn("save index", "err", err)
-		return
 	}
-	e.notify()
 }
 
 // persistLocked writes the index unless a batch is open.
@@ -966,7 +985,11 @@ func (e *Engine) persistLocked() error {
 		e.dirty = true
 		return nil
 	}
-	if err := e.saveLocked(); err != nil {
+	snap := cloneIndex(e.idx)
+	e.mu.Unlock()
+	err := e.saveSnapshot(snap)
+	e.mu.Lock()
+	if err != nil {
 		return err
 	}
 	e.notify()
@@ -994,4 +1017,64 @@ func fileMode(m uint32, dir bool) os.FileMode {
 		return 0o644
 	}
 	return perm
+}
+
+func foldKey(p string) string { return strings.ToLower(p) }
+
+// foldsCase reports whether the filesystem treats names that differ only by
+// case as the same file.
+func foldsCase(root string) bool {
+	probe := filepath.Join(root, tmpDirName)
+	if err := os.MkdirAll(probe, 0o700); err != nil {
+		return false
+	}
+	defer os.RemoveAll(probe)
+	name := filepath.Join(probe, "CaseProbe")
+	if err := os.WriteFile(name, []byte("x"), 0o600); err != nil {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(probe, "caseprobe"))
+	return err == nil
+}
+
+// foldOwners maps each folded path to the one live index entry that owns it.
+// It is called with e.mu held.
+func (e *Engine) foldOwners() map[string]string {
+	if !e.caseFold {
+		return nil
+	}
+	owners := make(map[string]string, len(e.idx.Files))
+	for path, file := range e.idx.Files {
+		if file.Deleted {
+			continue
+		}
+		key := foldKey(path)
+		if _, ok := owners[key]; !ok {
+			owners[key] = path
+		}
+	}
+	return owners
+}
+
+// removeIgnoredLeftovers removes a directory that failed a normal Remove only
+// when every remaining entry is ignored. Synced files must keep the directory
+// so a failed parent delete is never reported as a completed deletion.
+func (e *Engine) removeIgnoredLeftovers(rel string) bool {
+	ig := e.ignores()
+	ok := true
+	_ = fs.WalkDir(e.root.FS(), rel, func(name string, d fs.DirEntry, err error) error {
+		if err != nil || name == rel {
+			return nil
+		}
+		child := filepath.ToSlash(name)
+		if d.Type()&os.ModeSymlink != 0 || !ig.Match(child, d.IsDir()) {
+			ok = false
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if !ok {
+		return false
+	}
+	return e.root.RemoveAll(rel) == nil
 }

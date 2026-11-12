@@ -74,7 +74,11 @@ docker compose up -d --build
 服务起来之后：
 
 - 发现地址：`ws://<这台机器的 IP>:8080`
-- 健康检查：`http://<IP>:8080/health`
+- 健康检查：`https://<IP>:8080/health`（自签名证书，浏览器会先提示）
+
+发现服务的 WebSocket 始终走 TLS，房间凭证不会明文出现在网络上。客户端把
+`ws://` 和 `http://` 自动换成加密连接并跳过证书校验，适合局域网和自签名证书；
+在公网部署时建议给服务端配置正式证书，客户端改用 `wss://`，让证书得到校验。
 
 防火墙放行 `8080/tcp` 和 `3478/udp`。不要把文件同步端口理解成服务端端口；文件不进这台机器。
 
@@ -82,6 +86,14 @@ docker compose up -d --build
 
 ```bash
 peersync-server --listen :8080 --stun :3478
+```
+
+提供正式 TLS 证书时不使用临时自签名证书：
+
+```bash
+peersync-server --listen :8080 --stun :3478 \
+  --tls-cert /etc/peersync/server.crt \
+  --tls-key /etc/peersync/server.key
 ```
 
 ## 客户端

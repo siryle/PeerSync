@@ -5,12 +5,19 @@ package discover
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"regexp"
@@ -36,6 +43,11 @@ type Server struct {
 	// arrive here are not forwarded to anybody else.
 	Stun string
 	Log  *slog.Logger
+	// CertFile and KeyFile make discovery serve TLS with a real certificate.
+	// When both are empty, PeerSync generates a throwaway self-signed
+	// certificate so the room credential is never sent in plaintext.
+	CertFile string
+	KeyFile  string
 
 	// SignalBytes counts opaque signal payload bytes forwarded between peers.
 	// Directory contents never pass through the server.
@@ -117,6 +129,12 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.httpAddr = ln.Addr().String()
 	s.stunAddr = udp.LocalAddr().String()
+	tlsConf, err := s.tlsConfig()
+	if err != nil {
+		_ = ln.Close()
+		_ = udp.Close()
+		return err
+	}
 	close(s.ready)
 
 	mux := http.NewServeMux()
@@ -138,11 +156,51 @@ func (s *Server) Run(ctx context.Context) error {
 	go s.reflect(ctx, udp)
 
 	s.Log.Info("discovery listening", "http", s.httpAddr, "stun", s.stunAddr)
-	err = srv.Serve(ln)
+	err = srv.Serve(tls.NewListener(ln, tlsConf))
 	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) tlsConfig() (*tls.Config, error) {
+	if s.CertFile != "" || s.KeyFile != "" {
+		if s.CertFile == "" || s.KeyFile == "" {
+			return nil, errors.New("both tls cert and key are required")
+		}
+		cert, err := tls.LoadX509KeyPair(s.CertFile, s.KeyFile)
+		if err != nil {
+			return nil, err
+		}
+		return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
+	}
+	cert, err := selfSignedCert()
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
+}
+
+func selfSignedCert() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "peersync"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost", "peersync"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
 }
 
 func (s *Server) reflect(ctx context.Context, conn *net.UDPConn) {

@@ -2,6 +2,7 @@ package discover
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"log/slog"
@@ -115,14 +116,14 @@ func (c *Client) Signal(to string, sealed []byte) error {
 }
 
 func (c *Client) session(ctx context.Context) (established bool, err error) {
-	wsURL, err := websocketURL(c.URL)
+	wsURL, insecure, err := websocketURL(c.URL)
 	if err != nil {
 		return false, err
 	}
 	// A fresh transport avoids reusing a connection that died with the server.
 	// The handshake itself has a deadline, so a restart that accepts TCP and
 	// then never answers cannot pin this loop.
-	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: dialClient()})
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: dialClient(insecure)})
 	if err != nil {
 		return false, err
 	}
@@ -236,20 +237,22 @@ func (c *Client) session(ctx context.Context) (established bool, err error) {
 	}
 }
 
-func dialClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			ForceAttemptHTTP2:     false,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
-			ExpectContinueTimeout: time.Second,
-		},
+func dialClient(insecure bool) *http.Client {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     false,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: time.Second,
 	}
+	if insecure {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	return &http.Client{Transport: transport}
 }
 
 func toPeers(in []peerInfo) []Peer {
@@ -260,22 +263,26 @@ func toPeers(in []peerInfo) []Peer {
 	return out
 }
 
-func websocketURL(server string) (string, error) {
+func websocketURL(server string) (wsURL string, insecure bool, err error) {
 	u, err := url.Parse(server)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	switch u.Scheme {
 	case "http":
-		u.Scheme = "ws"
+		u.Scheme = "wss"
+		insecure = true
 	case "https":
 		u.Scheme = "wss"
-	case "ws", "wss":
+	case "ws":
+		u.Scheme = "wss"
+		insecure = true
+	case "wss":
 	default:
-		return "", errors.New("server url scheme must be ws, wss, http, or https")
+		return "", false, errors.New("server url scheme must be ws, wss, http, or https")
 	}
 	if u.Path == "" || u.Path == "/" {
 		u.Path = "/ws"
 	}
-	return u.String(), nil
+	return u.String(), insecure, nil
 }

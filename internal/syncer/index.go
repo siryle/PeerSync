@@ -122,6 +122,46 @@ func (e *Engine) saveLocked() error {
 	return os.Rename(tmp, e.IndexPath)
 }
 
+func cloneIndex(idx indexFile) indexFile {
+	out := indexFile{Seq: idx.Seq, Files: make(map[string]*File, len(idx.Files))}
+	for name, file := range idx.Files {
+		copied := *file
+		out.Files[name] = &copied
+	}
+	return out
+}
+
+// saveSnapshot writes one consistent index snapshot outside e.mu, so a large
+// tree does not hold up scan and transfer steps while the file is written.
+func (e *Engine) saveSnapshot(snap indexFile) error {
+	e.persistMu.Lock()
+	defer e.persistMu.Unlock()
+	e.mu.Lock()
+	current := e.idx.Seq
+	e.mu.Unlock()
+	if current != snap.Seq {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(e.IndexPath), 0o700); err != nil {
+		return err
+	}
+	tmp := e.IndexPath + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
+	err = writeIndex(f, snap)
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(tmp, e.IndexPath)
+}
+
 func writeIndex(dst io.Writer, idx indexFile) error {
 	w := bufio.NewWriterSize(dst, 64<<10)
 	if _, err := fmt.Fprintf(w, `{"seq":%d,"files":{`, idx.Seq); err != nil {

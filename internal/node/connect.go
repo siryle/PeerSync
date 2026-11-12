@@ -163,7 +163,7 @@ func (n *Node) punch(ctx context.Context, peerID string, addrs []string) {
 	if err != nil {
 		return
 	}
-	pkt := punchPacket(n.id.Public, pub)
+	pkt := punchPacket(n.id.Private, n.id.Public, pub, time.Now())
 	send := func() {
 		targets := n.punchTargets(peerID, addrs)
 		for _, addr := range targets {

@@ -340,6 +340,10 @@ func (s *session) done(task Task, err error) {
 		s.note(Note{Op: "fail", Path: task.Path, Detail: err.Error()})
 		return
 	}
+	if task.Hold {
+		s.note(Note{Op: "backup", Path: task.Path})
+		return
+	}
 	if task.Backup {
 		s.note(Note{Op: "backup", Path: task.Path})
 	}
