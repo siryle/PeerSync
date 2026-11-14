@@ -71,9 +71,13 @@ type room struct {
 type peer struct {
 	id     string
 	name   string
+	ip     string
 	send   chan []byte
 	cancel context.CancelFunc
 }
+
+// shortcut: one NAT is capped at 32 discovery sockets, raise it when a site syncs more folders than that
+const maxConnsPerIP = 32
 
 func (s *Server) init() {
 	s.initOnce.Do(func() {
@@ -237,6 +241,24 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer conn.CloseNow()
 
 	host := clientHost(r.RemoteAddr)
+	remoteIP := r.RemoteAddr
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		remoteIP = ip
+	}
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		return
+	}
+	challenge, err := marshal(serverMsg{Type: "challenge", Nonce: base64.StdEncoding.EncodeToString(nonce)})
+	if err != nil {
+		return
+	}
+	wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
+	err = conn.Write(wctx, websocket.MessageText, challenge)
+	wcancel()
+	if err != nil {
+		return
+	}
 
 	_, data, err := conn.Read(ctx)
 	if err != nil {
@@ -247,7 +269,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		writeErr(ctx, conn, "expected hello")
 		return
 	}
-	if !deviceIDRe.MatchString(hello.DeviceID) || !shareIDRe.MatchString(hello.ShareID) || !tokenRe.MatchString(hello.Token) {
+	if !deviceIDRe.MatchString(hello.DeviceID) || !shareIDRe.MatchString(hello.ShareID) || !tokenRe.MatchString(hello.Token) || !verifyHello(hello.DeviceID, hello.ShareID, hello.Token, nonce, hello.Sig) {
 		writeErr(ctx, conn, "invalid hello")
 		return
 	}
@@ -256,7 +278,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	send := make(chan []byte, 32)
-	p := &peer{id: hello.DeviceID, name: hello.Name, send: send, cancel: cancel}
+	p := &peer{id: hello.DeviceID, name: hello.Name, ip: remoteIP, send: send, cancel: cancel}
 	if err := s.join(hello.ShareID, hello.Token, p); err != nil {
 		writeErr(ctx, conn, err.Error())
 		return
@@ -340,6 +362,10 @@ func (s *Server) join(shareID, token string, p *peer) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rm := s.rooms[shareID]
+	replacing := rm != nil && rm.peers[p.id] != nil
+	if !replacing && s.connsFrom(p.ip) >= maxConnsPerIP {
+		return errors.New("too many connections")
+	}
 	if rm == nil {
 		if len(s.rooms) >= 100000 {
 			return errors.New("server is full")
@@ -356,6 +382,21 @@ func (s *Server) join(shareID, token string, p *peer) error {
 	}
 	rm.peers[p.id] = p
 	return nil
+}
+
+func (s *Server) connsFrom(ip string) int {
+	if ip == "" {
+		return 0
+	}
+	n := 0
+	for _, rm := range s.rooms {
+		for _, p := range rm.peers {
+			if p.ip == ip {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 func (s *Server) dropAll() {

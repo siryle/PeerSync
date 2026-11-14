@@ -4,6 +4,7 @@
 package discover
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -11,7 +12,35 @@ import (
 	"crypto/sha256"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/nacl/secretbox"
+
+	"github.com/netcraft/peersync/internal/identity"
 )
+
+func helloTranscript(deviceID, shareID, token string, nonce []byte) []byte {
+	b := make([]byte, 0, 80+len(nonce)+len(shareID)+len(token)+len(deviceID))
+	b = append(b, "peersync-hello-v1"...)
+	b = append(b, 0)
+	b = append(b, nonce...)
+	b = append(b, 0)
+	b = append(b, shareID...)
+	b = append(b, 0)
+	b = append(b, token...)
+	b = append(b, 0)
+	b = append(b, deviceID...)
+	return b
+}
+
+func signHello(priv ed25519.PrivateKey, deviceID, shareID, token string, nonce []byte) []byte {
+	return ed25519.Sign(priv, helloTranscript(deviceID, shareID, token, nonce))
+}
+
+func verifyHello(deviceID, shareID, token string, nonce, sig []byte) bool {
+	pub, err := identity.ParseDeviceID(deviceID)
+	if err != nil {
+		return false
+	}
+	return ed25519.Verify(pub, helloTranscript(deviceID, shareID, token, nonce), sig)
+}
 
 // SignalKey derives the key that seals candidate addresses for one folder.
 func SignalKey(shareKey []byte, shareID string) [32]byte {

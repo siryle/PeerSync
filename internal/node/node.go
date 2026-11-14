@@ -293,6 +293,7 @@ func (n *Node) addShare(sh config.Share) error {
 		Name:     n.cfg.DeviceName,
 		ShareID:  sh.ShareID,
 		Token:    invite.RoomToken(key[:], sh.ShareID),
+		Private:  n.id.Private,
 		Log:      n.log,
 		Handler: discover.Handler{
 			Welcome: func(ip string) {

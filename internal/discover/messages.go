@@ -11,6 +11,7 @@ type helloMsg struct {
 	Name     string `json:"name"`
 	ShareID  string `json:"share_id"`
 	Token    string `json:"token"`
+	Sig      []byte `json:"sig"`
 }
 
 type signalMsg struct {
@@ -34,6 +35,7 @@ type serverMsg struct {
 	From     string     `json:"from,omitempty"`
 	Data     string     `json:"data,omitempty"`
 	Error    string     `json:"error,omitempty"`
+	Nonce    string     `json:"nonce,omitempty"`
 }
 
 // SignalBody is the plaintext inside a sealed signal.

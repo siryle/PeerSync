@@ -13,7 +13,7 @@ import (
 var errIgnored = errors.New("path is ignored")
 
 func (e *Engine) setMetadata(rel string, r proto.Entry) (os.FileInfo, error) {
-	if err := e.root.Chmod(rel, fileMode(r.Mode, r.IsDir)); err != nil {
+	if err := e.root.Chmod(rel, fileMode(r.Mode, r.Mode0, r.IsDir)); err != nil {
 		return nil, err
 	}
 	if !r.IsDir {
@@ -103,9 +103,19 @@ func (e *Engine) checkLocalLocked(task Task) error {
 	case !info.Mode().IsRegular():
 		return errStale
 	default:
+		// Hashing a large file must not stall every other update in this folder.
+		e.mu.Unlock()
 		sum, blocks, size, err := e.hashFile(task.Path)
+		e.mu.Lock()
 		if err != nil {
 			return err
+		}
+		if !unchanged(e.idx.Files[task.Path], task) {
+			return errStale
+		}
+		info, err = e.root.Lstat(task.Path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() != size {
+			return errStale
 		}
 		changed = e.upsertFile(task.Path, size, info.ModTime().UnixNano(), uint32(info.Mode().Perm()), sum, blocks)
 	}

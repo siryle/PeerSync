@@ -31,6 +31,7 @@ type File struct {
 	Size    int64         `json:"size,omitempty"`
 	ModTime int64         `json:"mod_time,omitempty"`
 	Mode    uint32        `json:"mode,omitempty"`
+	Mode0   bool          `json:"mode0,omitempty"` // Mode 0 is real; a missing mode is still the default.
 	IsDir   bool          `json:"dir,omitempty"`
 	Deleted bool          `json:"deleted,omitempty"`
 	Sum     [32]byte      `json:"sum,omitempty"`
@@ -365,6 +366,7 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 	// Paths under a directory that could not be read. They must not be
 	// tombstoned: a failed listing is not evidence that the files are gone.
 	var unread []string
+	var links []string
 	var rootErr error
 	walk := func(rel string, d fs.DirEntry, err error) error {
 		if ctx.Err() != nil {
@@ -399,6 +401,10 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 			return nil
 		}
 		if d.Type()&os.ModeSymlink != 0 {
+			// A link hides whatever it replaced. That is not evidence the files are gone.
+			if ValidRel(rel) {
+				links = append(links, rel)
+			}
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -531,8 +537,9 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 			}
 			continue
 		}
-		if cur != nil && !cur.Deleted && cur.Mode != it.mode {
+		if cur != nil && !cur.Deleted && (cur.Mode != it.mode || cur.Mode0 != (it.mode == 0)) {
 			cur.Mode = it.mode
+			cur.Mode0 = it.mode == 0
 			cur.Version = e.clocks.Intern(vclock.Bump(cur.Version, e.Self))
 			cur.Local = e.Mode == config.ReceiveOnly
 			changed = true
@@ -546,7 +553,7 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 		}
 	}
 	for rel, f := range e.idx.Files {
-		if !inScope(rel) || seen[rel] || f.Deleted || e.inflight[rel] > 0 || unreadCovers(unread, rel) {
+		if !inScope(rel) || seen[rel] || f.Deleted || e.inflight[rel] > 0 || unreadCovers(unread, rel) || unreadCovers(links, rel) {
 			continue
 		}
 		if foldSeen != nil && foldSeen[foldKey(rel)] {
@@ -605,11 +612,12 @@ func (e *Engine) ignores() ignore.Set {
 
 func (e *Engine) upsertDir(rel string, mode uint32) bool {
 	prev := e.idx.Files[rel]
-	if prev != nil && !prev.Deleted && prev.IsDir {
-		if prev.Mode == mode {
+	zero := mode == 0
+	if prev != nil && !prev.Deleted && prev.IsDir && prev.Mode == mode {
+		if prev.Mode0 == zero {
 			return false
 		}
-		prev.Mode = mode
+		prev.Mode0 = zero
 		prev.Version = e.clocks.Intern(vclock.Bump(prev.Version, e.Self))
 		prev.Local = e.Mode == config.ReceiveOnly
 		return true
@@ -618,18 +626,25 @@ func (e *Engine) upsertDir(rel string, mode uint32) bool {
 	if prev != nil {
 		ver = prev.Version
 	}
-	e.idx.Files[rel] = &File{IsDir: true, Mode: mode, Version: e.clocks.Intern(vclock.Bump(ver, e.Self)), Local: e.Mode == config.ReceiveOnly}
+	e.idx.Files[rel] = &File{IsDir: true, Mode: mode, Mode0: zero, Version: e.clocks.Intern(vclock.Bump(ver, e.Self)), Local: e.Mode == config.ReceiveOnly}
 	return true
 }
 
 func (e *Engine) upsertFile(rel string, size, mtime int64, mode uint32, sum [32]byte, blocks [][32]byte) bool {
 	prev := e.idx.Files[rel]
+	zero := mode == 0
 	if prev != nil && !prev.Deleted && !prev.IsDir && prev.Sum == sum && prev.ModTime == mtime && prev.Mode == mode {
 		prev.Size = size
 		prev.ModTime = mtime
 		prev.Mode = mode
 		prev.Blocks = blocks
-		return false
+		if prev.Mode0 == zero {
+			return false
+		}
+		prev.Mode0 = zero
+		prev.Version = e.clocks.Intern(vclock.Bump(prev.Version, e.Self))
+		prev.Local = e.Mode == config.ReceiveOnly
+		return true
 	}
 	ver := vclock.Vector{}
 	if prev != nil {
@@ -663,6 +678,7 @@ func (e *Engine) entries(cloneVersions bool) (uint64, []proto.Entry) {
 			Size:    f.Size,
 			ModTime: f.ModTime,
 			Mode:    f.Mode,
+			Mode0:   f.Mode0,
 			IsDir:   f.IsDir,
 			Deleted: f.Deleted,
 			Sum:     proto.EncodeSum(f.Sum, !f.Deleted && !f.IsDir),
@@ -710,11 +726,17 @@ func (e *Engine) Plan(remote []proto.Entry) []Task {
 	return append(holds, tasks...)
 }
 
-// Meta returns the block list of a non-deleted file.
+// Meta returns the block list of a non-deleted file for a peer that asked.
 func (e *Engine) Meta(rel string) (sum [32]byte, blocks [][32]byte, size int64, err error) {
 	if e.Mode == config.ReceiveOnly {
 		return sum, nil, 0, errors.New("receive-only folder does not serve files")
 	}
+	return e.fileBlocks(rel)
+}
+
+// fileBlocks is the local block list used to plan a download. Receive-only
+// folders use it too; Meta is what refuses to serve those bytes to a peer.
+func (e *Engine) fileBlocks(rel string) (sum [32]byte, blocks [][32]byte, size int64, err error) {
 	if !ValidRel(rel) {
 		return sum, nil, 0, errors.New("bad path")
 	}
@@ -820,6 +842,7 @@ func (e *Engine) ApplyMerge(task Task) error {
 			return err
 		}
 		cur.Mode = uint32(info.Mode().Perm())
+		cur.Mode0 = cur.Mode == 0
 		if !cur.IsDir {
 			cur.ModTime = info.ModTime().UnixNano()
 		}
@@ -848,14 +871,15 @@ func (e *Engine) ApplyDir(task Task) error {
 			return err
 		}
 	}
-	if err := e.root.MkdirAll(task.Path, fileMode(task.Remote.Mode, true)); err != nil {
+	if err := e.root.MkdirAll(task.Path, fileMode(task.Remote.Mode, task.Remote.Mode0, true)); err != nil {
 		return err
 	}
 	info, err := e.setMetadata(task.Path, task.Remote)
 	if err != nil {
 		return err
 	}
-	e.idx.Files[task.Path] = &File{IsDir: true, Mode: uint32(info.Mode().Perm()), Version: e.clocks.Intern(task.Version)}
+	perm := uint32(info.Mode().Perm())
+	e.idx.Files[task.Path] = &File{IsDir: true, Mode: perm, Mode0: perm == 0, Version: e.clocks.Intern(task.Version)}
 	e.idx.Seq++
 	return e.persistLocked()
 }
@@ -916,12 +940,13 @@ func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error 
 	}
 	if err := e.root.Rename(tmp, task.Path); err != nil {
 		if replacingDir {
-			return errors.Join(err, e.root.Mkdir(task.Path, fileMode(cur.Mode, true)))
+			return errors.Join(err, e.root.Mkdir(task.Path, fileMode(cur.Mode, cur.Mode0, true)))
 		}
 		return err
 	}
+	perm := uint32(info.Mode().Perm())
 	e.idx.Files[task.Path] = &File{
-		Size: task.Remote.Size, ModTime: info.ModTime().UnixNano(), Mode: uint32(info.Mode().Perm()),
+		Size: task.Remote.Size, ModTime: info.ModTime().UnixNano(), Mode: perm, Mode0: perm == 0,
 		Sum: sum, Blocks: blocks, Version: e.clocks.Intern(task.Version),
 	}
 	e.idx.Seq++
@@ -1008,9 +1033,9 @@ func relOf(root, abs string) (string, error) {
 	return rel, nil
 }
 
-func fileMode(m uint32, dir bool) os.FileMode {
+func fileMode(m uint32, keepZero, dir bool) os.FileMode {
 	perm := os.FileMode(m) & 0o777
-	if perm == 0 {
+	if perm == 0 && !keepZero {
 		if dir {
 			return 0o755
 		}

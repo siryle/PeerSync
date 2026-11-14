@@ -2,6 +2,7 @@ package discover
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -40,6 +41,7 @@ type Client struct {
 	Name     string
 	ShareID  string
 	Token    string
+	Private  ed25519.PrivateKey
 	Log      *slog.Logger
 	Handler  Handler
 
@@ -132,12 +134,27 @@ func (c *Client) session(ctx context.Context) (established bool, err error) {
 	defer scancel()
 	defer conn.CloseNow()
 
+	rctx, rcancel := context.WithTimeout(ctx, 10*time.Second)
+	_, data, err := conn.Read(rctx)
+	rcancel()
+	if err != nil {
+		return false, err
+	}
+	var chal serverMsg
+	if err := unmarshal(data, &chal); err != nil || chal.Type != "challenge" {
+		return false, errors.New("expected discovery challenge")
+	}
+	nonce, err := base64.StdEncoding.DecodeString(chal.Nonce)
+	if err != nil || len(nonce) != 32 || len(c.Private) != ed25519.PrivateKeySize {
+		return false, errors.New("expected discovery challenge")
+	}
 	hello, err := marshal(helloMsg{
 		Type:     "hello",
 		DeviceID: c.DeviceID,
 		Name:     c.Name,
 		ShareID:  c.ShareID,
 		Token:    c.Token,
+		Sig:      signHello(c.Private, c.DeviceID, c.ShareID, c.Token, nonce),
 	})
 	if err != nil {
 		return false, err

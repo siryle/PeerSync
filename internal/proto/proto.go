@@ -66,6 +66,7 @@ type Entry struct {
 	Size    int64         `json:"size,omitempty"`
 	ModTime int64         `json:"mod_time,omitempty"`
 	Mode    uint32        `json:"mode,omitempty"`
+	Mode0   bool          `json:"mode0,omitempty"`
 	IsDir   bool          `json:"dir,omitempty"`
 	Deleted bool          `json:"deleted,omitempty"`
 	Sum     string        `json:"sum,omitempty"`

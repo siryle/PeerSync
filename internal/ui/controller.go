@@ -365,15 +365,18 @@ func (c *Controller) JoinShare(code, path, label string, options ...syncer.Optio
 		if err := overlap(cfg.Shares, abs); err != nil {
 			return err
 		}
+		next := cfg.Server
 		if material.Server != "" {
-			server, err = cleanServer(material.Server)
+			next, err = cleanServer(material.Server)
 			if err != nil {
 				return err
 			}
-			cfg.Server = server
-		} else {
-			server = cfg.Server
 		}
+		next, err = config.MergeDiscoveryServer(cfg.Server, next, len(cfg.Shares) > 0)
+		if err != nil {
+			return errors.New("邀请码里的发现服务和这台设备已有的不一样。请先在设置里修改发现服务，再加入。")
+		}
+		server, cfg.Server = next, next
 		cfg.Shares = append(cfg.Shares, config.Share{
 			Label:    label,
 			Path:     abs,

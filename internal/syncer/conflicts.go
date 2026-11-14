@@ -185,16 +185,32 @@ func (e *Engine) stageConflictLocked(task Task) error {
 	if cur == nil || cur.Deleted || cur.IsDir {
 		return errStale
 	}
+	snap := *cur
+	snap.Version = vclock.Clone(cur.Version)
+	e.mu.Unlock()
+	err := e.copyConflict(task.Path, snap)
+	e.mu.Lock()
+	if err != nil {
+		return err
+	}
+	now := e.idx.Files[task.Path]
+	if now == nil || now.Deleted || now.IsDir || now.Sum != snap.Sum || now.Size != snap.Size || vclock.Compare(now.Version, snap.Version) != 0 {
+		return errStale
+	}
+	return nil
+}
+
+func (e *Engine) copyConflict(path string, cur File) error {
 	version, _ := json.Marshal(cur.Version)
 	h := sha256.New()
-	h.Write([]byte(task.Path + "\x00"))
+	h.Write([]byte(path + "\x00"))
 	h.Write(cur.Sum[:])
 	h.Write(version)
 	id := hex.EncodeToString(h.Sum(nil))
 	if c, f, err := OpenConflict(e.IndexPath, id); err == nil {
 		sum, _, size, hashErr := HashReader(f)
 		f.Close()
-		if hashErr == nil && c.Path == task.Path && sum == cur.Sum && size == cur.Size {
+		if hashErr == nil && c.Path == path && sum == cur.Sum && size == cur.Size {
 			return nil
 		}
 		return errors.New("existing backup failed verification")
@@ -209,7 +225,7 @@ func (e *Engine) stageConflictLocked(task Task) error {
 		return err
 	}
 	defer dir.Close()
-	in, err := e.openFile(task.Path)
+	in, err := e.openFile(path)
 	if err != nil {
 		return err
 	}
@@ -248,7 +264,7 @@ func (e *Engine) stageConflictLocked(task Task) error {
 		dir.Remove(id + ".data")
 		return err
 	}
-	c := Conflict{ID: id, Path: task.Path, CreatedAt: time.Now().UTC(),
+	c := Conflict{ID: id, Path: path, CreatedAt: time.Now().UTC(),
 		Size: size, ModTime: cur.ModTime, Mode: cur.Mode, Sum: proto.EncodeSum(sum, true)}
 	b, err := json.Marshal(c)
 	if err != nil {
@@ -385,7 +401,7 @@ func (e *Engine) RestoreConflict(id, expected string) error {
 	if proto.EncodeSum(sum, true) != c.Sum || size != c.Size {
 		return errors.New("backup failed checksum verification")
 	}
-	info, err := e.setMetadata(tmp, proto.Entry{Mode: c.Mode, ModTime: c.ModTime})
+	info, err := e.setMetadata(tmp, proto.Entry{Mode: c.Mode, Mode0: true, ModTime: c.ModTime})
 	if err != nil {
 		return err
 	}
@@ -411,6 +427,8 @@ func (e *Engine) RestoreConflict(id, expected string) error {
 // from a local file. On a case-insensitive filesystem writing it would
 // overwrite that local file, so the bytes are saved as a conflict backup.
 func (e *Engine) backupIncomingLocked(task Task, tmp string) error {
+	e.mu.Unlock()
+	defer e.mu.Lock()
 	remoteSum, ok := proto.DecodeSum(task.Remote.Sum)
 	if !ok {
 		return errors.New("bad remote checksum")

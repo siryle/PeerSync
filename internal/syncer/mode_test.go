@@ -1,12 +1,15 @@
 package syncer
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/netcraft/peersync/internal/config"
+	"github.com/netcraft/peersync/internal/proto"
 )
 
 func waitBackups(t *testing.T, e *Engine, count int) []Conflict {
@@ -195,4 +198,22 @@ func TestReceiveOnlyDoesNotArchiveIdenticalContent(t *testing.T) {
 	connectEngines(t, a, b, nil)
 	waitIndexes(t, 1, a, b)
 	waitBackups(t, b, 0)
+}
+
+func TestReceiveOnlyPlansFromLocalBlocks(t *testing.T) {
+	e := testEngine(t, "B", Options{Mode: config.ReceiveOnly, SourceID: "A"})
+	body := bytes.Repeat([]byte("a"), proto.BlockSize+10)
+	putFile(t, filepath.Join(e.Root, "big.bin"), string(body))
+	scan(t, e)
+	_, blocks, size, err := e.fileBlocks("big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks[len(blocks)-1] = sha256.Sum256([]byte("nope"))
+	if plan := (&session{e: e}).planTransfer("big.bin", blocks, size); plan.kind != planRanges {
+		t.Fatalf("kind %v", plan.kind)
+	}
+	if _, _, _, err := e.Meta("big.bin"); err == nil {
+		t.Fatal("receive-only served blocks")
+	}
 }

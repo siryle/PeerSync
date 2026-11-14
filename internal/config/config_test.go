@@ -6,6 +6,20 @@ import (
 	"time"
 )
 
+func TestMergeDiscoveryServer(t *testing.T) {
+	got, err := MergeDiscoveryServer("ws://home:8080", "ws://home:8080/", true)
+	if err != nil || got != "ws://home:8080" {
+		t.Fatalf("same server: %q %v", got, err)
+	}
+	got, err = MergeDiscoveryServer("ws://home:8080", "ws://other:8080", false)
+	if err != nil || got != "ws://other:8080" {
+		t.Fatalf("first folder: %q %v", got, err)
+	}
+	if _, err = MergeDiscoveryServer("ws://home:8080", "ws://other:8080", true); err != ErrServerInUse {
+		t.Fatalf("got %v", err)
+	}
+}
+
 func TestScanIntervals(t *testing.T) {
 	for _, tc := range []struct {
 		name, scan, verify, bad string

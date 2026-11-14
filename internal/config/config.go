@@ -158,6 +158,28 @@ func Save(path string, cfg Config) error {
 	return os.Rename(tmp, path)
 }
 
+// ErrServerInUse means an invite names a different discovery server while
+// this device already syncs other folders through the current one.
+var ErrServerInUse = errors.New("invite discovery server differs from the one already in use")
+
+// MergeDiscoveryServer keeps the current server when an invite would retarget
+// folders that are already syncing. The invite server is used only before the
+// first folder is added.
+func MergeDiscoveryServer(current, invite string, hasShares bool) (string, error) {
+	invite = strings.TrimSpace(invite)
+	if invite == "" || sameServer(current, invite) {
+		return current, nil
+	}
+	if hasShares {
+		return "", ErrServerInUse
+	}
+	return invite, nil
+}
+
+func sameServer(a, b string) bool {
+	return strings.TrimRight(strings.TrimSpace(a), "/") == strings.TrimRight(strings.TrimSpace(b), "/")
+}
+
 // IndexPath is where a folder's index is stored, outside the synced tree.
 func IndexPath(home, shareID string) string {
 	return filepath.Join(home, "indexes", shareID+".json")

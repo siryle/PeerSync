@@ -2,6 +2,7 @@ package discover
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -9,6 +10,74 @@ import (
 	"github.com/netcraft/peersync/internal/identity"
 	"github.com/netcraft/peersync/internal/invite"
 )
+
+func TestJoinCapsConnectionsPerIP(t *testing.T) {
+	s := &Server{}
+	s.init()
+	token := "aa"
+	var first string
+	for i := 0; i < maxConnsPerIP; i++ {
+		id, err := identity.Generate()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			first = id.DeviceID()
+		}
+		p := &peer{id: id.DeviceID(), ip: "203.0.113.9", send: make(chan []byte, 1), cancel: func() {}}
+		if err := s.join(fmt.Sprintf("%032x", i), token, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.join(fmt.Sprintf("%032x", maxConnsPerIP), token, &peer{id: id.DeviceID(), ip: "203.0.113.9", send: make(chan []byte, 1), cancel: func() {}}); err == nil {
+		t.Fatal("expected the per-address cap")
+	}
+	if err := s.join(fmt.Sprintf("%032x", maxConnsPerIP+1), token, &peer{id: id.DeviceID(), ip: "203.0.113.10", send: make(chan []byte, 1), cancel: func() {}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.join(fmt.Sprintf("%032x", 0), token, &peer{id: first, ip: "203.0.113.9", send: make(chan []byte, 1), cancel: func() {}}); err != nil {
+		t.Fatalf("replacing an existing device should stay under the cap: %v", err)
+	}
+}
+
+func TestHelloRejectsForeignKey(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	srv := &Server{Listen: "127.0.0.1:0", Stun: "127.0.0.1:0"}
+	go srv.Run(ctx)
+	if err := srv.Ready(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := identity.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	material, err := invite.NewShare()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shareID := invite.IDHex(material.ShareID)
+	welcomes := make(chan struct{}, 1)
+	go (&Client{
+		URL: "ws://" + srv.HTTPAddr(), DeviceID: dev.DeviceID(), Name: "x",
+		ShareID: shareID, Token: invite.RoomToken(material.ShareKey[:], shareID),
+		Private: other.Private,
+		Handler: Handler{Welcome: func(string) { welcomes <- struct{}{} }},
+	}).Run(ctx)
+	select {
+	case <-welcomes:
+		t.Fatal("foreign key was accepted")
+	case <-time.After(700 * time.Millisecond):
+	}
+}
 
 func TestClientHostIgnoresLoopback(t *testing.T) {
 	if got := clientHost("127.0.0.1:42420"); got != "" {
@@ -73,6 +142,7 @@ func TestClientReconnectsAfterRestart(t *testing.T) {
 		Name:     "rejoin",
 		ShareID:  shareID,
 		Token:    invite.RoomToken(material.ShareKey[:], shareID),
+		Private:  dev.Private,
 		Handler:  Handler{Welcome: func(string) { welcomes <- struct{}{} }},
 	}
 	go client.Run(ctx)
@@ -122,11 +192,11 @@ func TestSignalDoesNotCarryDirectory(t *testing.T) {
 	got := make(chan []byte, 1)
 	ca := &Client{
 		URL: "ws://" + srv.HTTPAddr(), DeviceID: aID.DeviceID(), Name: "a",
-		ShareID: id, Token: token,
+		ShareID: id, Token: token, Private: aID.Private,
 	}
 	cb := &Client{
 		URL: "ws://" + srv.HTTPAddr(), DeviceID: bID.DeviceID(), Name: "b",
-		ShareID: id, Token: token,
+		ShareID: id, Token: token, Private: bID.Private,
 		Handler: Handler{Signal: func(from string, sealed []byte) {
 			if from == aID.DeviceID() {
 				got <- sealed

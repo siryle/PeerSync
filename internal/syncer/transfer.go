@@ -211,7 +211,7 @@ func (s *session) planTransfer(rel string, blocks [][32]byte, remoteSize int64) 
 	if len(blocks) == 0 {
 		return all
 	}
-	_, localBlocks, localSize, err := s.e.Meta(rel)
+	_, localBlocks, localSize, err := s.e.fileBlocks(rel)
 	if err != nil || localSize <= 0 {
 		return all
 	}

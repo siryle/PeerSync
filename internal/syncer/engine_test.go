@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -259,6 +260,74 @@ func entryPaths(entries []proto.Entry) []string {
 		out[i] = e.Path
 	}
 	return out
+}
+
+func TestSymlinkReplacementDoesNotDelete(t *testing.T) {
+	e := testEngine(t, "A")
+	putFile(t, filepath.Join(e.Root, "docs", "a.txt"), "keep")
+	scan(t, e)
+	if err := os.RemoveAll(filepath.Join(e.Root, "docs")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(e.Root, "docs")); err != nil {
+		t.Skip(err)
+	}
+	if err := e.Scan(); err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if f := e.idx.Files["docs/a.txt"]; f == nil || f.Deleted {
+		t.Fatalf("%+v", f)
+	}
+	if d := e.idx.Files["docs"]; d == nil || d.Deleted {
+		t.Fatalf("%+v", d)
+	}
+}
+
+func TestZeroModeRoundTrip(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows does not store unix mode 0")
+	}
+	e := testEngine(t, "A")
+	name := filepath.Join(e.Root, "a.txt")
+	putFile(t, name, "x")
+	scan(t, e)
+	if err := os.Chmod(name, 0); err != nil {
+		t.Fatal(err)
+	}
+	scan(t, e)
+	e.mu.Lock()
+	f := e.idx.Files["a.txt"]
+	if f == nil || f.Mode != 0 || !f.Mode0 {
+		e.mu.Unlock()
+		t.Fatalf("%+v", f)
+	}
+	e.mu.Unlock()
+	_, entries := e.Entries()
+	found := false
+	for _, ent := range entries {
+		if ent.Path == "a.txt" {
+			found = ent.Mode == 0 && ent.Mode0
+		}
+	}
+	if !found {
+		t.Fatalf("%+v", entries)
+	}
+	if _, err := e.setMetadata("a.txt", proto.Entry{Mode: 0}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(name)
+	if err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("missing mode: %v %v", info, err)
+	}
+	if _, err := e.setMetadata("a.txt", proto.Entry{Mode: 0, Mode0: true}); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Stat(name)
+	if err != nil || info.Mode().Perm() != 0 {
+		t.Fatalf("explicit zero: %v %v", info, err)
+	}
 }
 
 func versionOf(t *testing.T, e *Engine, path string) map[string]uint64 {

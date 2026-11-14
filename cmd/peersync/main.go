@@ -360,9 +360,11 @@ func cmdShareJoin(args []string) {
 	if *label == "" {
 		*label = filepath.Base(abs)
 	}
-	if material.Server != "" {
-		cfg.Server = material.Server
+	merged, err := config.MergeDiscoveryServer(cfg.Server, material.Server, len(cfg.Shares) > 0)
+	if err != nil {
+		fatal(err)
 	}
+	cfg.Server = merged
 	cfg.Shares = append(cfg.Shares, config.Share{
 		Label:    *label,
 		Path:     abs,
@@ -541,9 +543,11 @@ func applyEnv(home, serverFlag string) error {
 			if label == "" {
 				label = filepath.Base(abs)
 			}
-			if material.Server != "" {
-				cfg.Server = material.Server
+			merged, err := config.MergeDiscoveryServer(cfg.Server, material.Server, len(cfg.Shares) > 0)
+			if err != nil {
+				return err
 			}
+			cfg.Server = merged
 			cfg.Shares = append(cfg.Shares, config.Share{
 				Label:    label,
 				Path:     abs,
