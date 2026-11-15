@@ -3,6 +3,8 @@ package syncer
 import (
 	"errors"
 	"os"
+	"path"
+	"path/filepath"
 	"time"
 
 	"github.com/netcraft/peersync/internal/config"
@@ -12,7 +14,73 @@ import (
 
 var errIgnored = errors.New("path is ignored")
 
+// Root confines links to the share, but parents must not redirect sync paths.
+func (e *Engine) checkParents(rel string) error {
+	if !filepath.IsLocal(filepath.FromSlash(rel)) {
+		return errors.New("bad path")
+	}
+	for parent := path.Dir(rel); parent != "."; parent = path.Dir(parent) {
+		info, err := e.root.Lstat(parent)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("symlink parent is not synchronized")
+		}
+	}
+	return nil
+}
+
+// Called with e.mu held; restore directory permissions before releasing it.
+func (e *Engine) withWritableParents(rel string, fn func() error) (err error) {
+	if err := e.checkParents(rel); err != nil {
+		return err
+	}
+	var parents []string
+	for p := path.Dir(rel); p != "."; p = path.Dir(p) {
+		parents = append(parents, p)
+	}
+	type permission struct {
+		path string
+		mode os.FileMode
+	}
+	var restore []permission
+	defer func() {
+		for i := len(restore) - 1; i >= 0; i-- {
+			p := restore[i]
+			err = errors.Join(err, e.root.Chmod(p.path, p.mode))
+		}
+	}()
+	for i := len(parents) - 1; i >= 0; i-- {
+		p := parents[i]
+		info, statErr := e.root.Lstat(p)
+		if errors.Is(statErr, os.ErrNotExist) {
+			continue
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if !info.IsDir() {
+			return errors.New("parent is not a directory")
+		}
+		mode := info.Mode().Perm()
+		if mode&0o300 != 0o300 {
+			if err := e.root.Chmod(p, mode|0o300); err != nil {
+				return err
+			}
+			restore = append(restore, permission{p, mode})
+		}
+	}
+	return fn()
+}
+
 func (e *Engine) setMetadata(rel string, r proto.Entry) (os.FileInfo, error) {
+	if err := e.checkParents(rel); err != nil {
+		return nil, err
+	}
 	if err := e.root.Chmod(rel, fileMode(r.Mode, r.Mode0, r.IsDir)); err != nil {
 		return nil, err
 	}
@@ -30,6 +98,9 @@ func (e *Engine) setMetadata(rel string, r proto.Entry) (os.FileInfo, error) {
 
 // openFile confines reads to the share and never reads a pipe or device.
 func (e *Engine) openFile(rel string) (*os.File, error) {
+	if err := e.checkParents(rel); err != nil {
+		return nil, err
+	}
 	info, err := e.root.Lstat(rel)
 	if err != nil {
 		return nil, err
@@ -81,8 +152,15 @@ func (e *Engine) checkLocalLocked(task Task) error {
 	}
 	cur := e.idx.Files[task.Path]
 	dir := task.Remote.IsDir || (cur != nil && cur.IsDir)
-	if e.ignores().Match(task.Path, dir) {
+	ig, err := e.ignores()
+	if err != nil {
+		return err
+	}
+	if ig.Match(task.Path, dir) {
 		return errIgnored
+	}
+	if err := e.checkParents(task.Path); err != nil {
+		return err
 	}
 	if !unchanged(cur, task) {
 		return errStale

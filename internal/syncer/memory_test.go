@@ -27,18 +27,19 @@ func memoryFixture(b *testing.B) *Engine {
 		e.idx.Files[fmt.Sprintf("projects/project-%04d/src/module-%04d/file-%06d.txt", i/1000, i/100, i)] = &File{Size: 1024, ModTime: 1700000000000000000, Mode: 0600, Sum: [32]byte{1, 2, 3, 4}, Blocks: [][32]byte{{1, 2, 3, 4}}, Version: vclock.Vector{e.Self: 1, "PS" + strings.Repeat("B", 52): 1}}
 	}
 	e.idx.Seq = 1
+	e.scanComplete = true
 	return e
 }
 
 func BenchmarkIndexMemory200k(b *testing.B) {
 	e := memoryFixture(b)
-	if err := e.saveLocked(); err != nil {
+	if err := e.saveSnapshot(e.idx); err != nil {
 		b.Fatal(err)
 	}
 	b.Run("Save", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			if err := e.saveLocked(); err != nil {
+			if err := e.saveSnapshot(e.idx); err != nil {
 				b.Fatal(err)
 			}
 		}

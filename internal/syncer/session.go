@@ -213,9 +213,18 @@ func (s *session) syncLoop(sub <-chan struct{}) error {
 }
 
 func (s *session) sendIndex() error {
+	if _, err := s.e.ignores(); err != nil {
+		return nil
+	}
 	var entries []proto.Entry
-	if s.e.Mode != config.ReceiveOnly {
-		_, entries = s.e.entries(false)
+	s.e.mu.Lock()
+	complete := s.e.scanComplete
+	if complete && s.e.Mode != config.ReceiveOnly {
+		_, entries = s.e.entriesLocked(false)
+	}
+	s.e.mu.Unlock()
+	if !complete {
+		return nil
 	}
 	const pageSize = 40
 	total := (len(entries) + pageSize - 1) / pageSize

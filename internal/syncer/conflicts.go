@@ -201,6 +201,8 @@ func (e *Engine) stageConflictLocked(task Task) error {
 }
 
 func (e *Engine) copyConflict(path string, cur File) error {
+	e.backupMu.Lock()
+	defer e.backupMu.Unlock()
 	version, _ := json.Marshal(cur.Version)
 	h := sha256.New()
 	h.Write([]byte(path + "\x00"))
@@ -353,7 +355,11 @@ func (e *Engine) RestoreConflict(id, expected string) error {
 	defer backup.Close()
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.ignores().Match(c.Path, false) {
+	ig, err := e.ignores()
+	if err != nil {
+		return err
+	}
+	if ig.Match(c.Path, false) {
 		return errIgnored
 	}
 	cur := e.idx.Files[c.Path]
@@ -412,10 +418,12 @@ func (e *Engine) RestoreConflict(id, expected string) error {
 	if err := e.checkLocalLocked(task); err != nil {
 		return err
 	}
-	if err := e.root.MkdirAll(path.Dir(c.Path), 0o755); err != nil {
-		return err
-	}
-	if err := e.root.Rename(tmp, c.Path); err != nil {
+	if err := e.withWritableParents(c.Path, func() error {
+		if err := e.root.MkdirAll(path.Dir(c.Path), 0o755); err != nil {
+			return err
+		}
+		return e.root.Rename(tmp, c.Path)
+	}); err != nil {
 		return err
 	}
 	e.upsertFile(c.Path, size, info.ModTime().UnixNano(), uint32(info.Mode().Perm()), sum, blocks)
@@ -429,6 +437,11 @@ func (e *Engine) RestoreConflict(id, expected string) error {
 func (e *Engine) backupIncomingLocked(task Task, tmp string) error {
 	e.mu.Unlock()
 	defer e.mu.Lock()
+	e.backupMu.Lock()
+	defer e.backupMu.Unlock()
+	if err := CheckConflictLocation(e.Root, e.IndexPath); err != nil {
+		return err
+	}
 	remoteSum, ok := proto.DecodeSum(task.Remote.Sum)
 	if !ok {
 		return errors.New("bad remote checksum")
@@ -461,16 +474,19 @@ func (e *Engine) backupIncomingLocked(task Task, tmp string) error {
 	}
 	defer in.Close()
 	out, err := dir.OpenFile(id+".data", os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
-	if err != nil {
-		return err
+	if errors.Is(err, os.ErrExist) {
+		out, err = dir.OpenFile(id+".data", readFileFlags, 0)
+	} else if err == nil {
+		_, err = io.Copy(out, in)
+		if err == nil {
+			err = out.Sync()
+		}
 	}
-	_, err = io.Copy(out, in)
-	if err == nil {
-		err = out.Sync()
-	}
 	if err != nil {
-		_ = out.Close()
-		_ = dir.Remove(id + ".data")
+		if out != nil {
+			_ = out.Close()
+			_ = dir.Remove(id + ".data")
+		}
 		return err
 	}
 	if _, err = out.Seek(0, io.SeekStart); err != nil {

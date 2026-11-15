@@ -296,7 +296,8 @@ func TestZeroModeRoundTrip(t *testing.T) {
 	if err := os.Chmod(name, 0); err != nil {
 		t.Fatal(err)
 	}
-	scan(t, e)
+	// A mode 000 file may fail content verification; its known metadata survives.
+	_ = e.Scan()
 	e.mu.Lock()
 	f := e.idx.Files["a.txt"]
 	if f == nil || f.Mode != 0 || !f.Mode0 {

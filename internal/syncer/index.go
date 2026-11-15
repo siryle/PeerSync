@@ -101,27 +101,6 @@ func indexDelimiter(d *json.Decoder, want json.Delim) error {
 	return nil
 }
 
-func (e *Engine) saveLocked() error {
-	if err := os.MkdirAll(filepath.Dir(e.IndexPath), 0o700); err != nil {
-		return err
-	}
-	tmp := e.IndexPath + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp)
-	err = writeIndex(f, e.idx)
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return os.Rename(tmp, e.IndexPath)
-}
-
 func cloneIndex(idx indexFile) indexFile {
 	out := indexFile{Seq: idx.Seq, Files: make(map[string]*File, len(idx.Files))}
 	for name, file := range idx.Files {
@@ -152,6 +131,9 @@ func (e *Engine) saveSnapshot(snap indexFile) error {
 	}
 	defer os.Remove(tmp)
 	err = writeIndex(f, snap)
+	if err == nil {
+		err = f.Sync()
+	}
 	closeErr := f.Close()
 	if err != nil {
 		return err

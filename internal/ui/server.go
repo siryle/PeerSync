@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"time"
 
@@ -40,7 +41,7 @@ func Listen(ctx context.Context, c *Controller, addr string) (page, token string
 			return "", "", err
 		}
 	}
-	srv := &http.Server{Handler: handler(c, token)}
+	srv := &http.Server{Handler: handler(c, token), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shut, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -287,6 +288,17 @@ func apiWith(token string, fn http.HandlerFunc) http.HandlerFunc {
 			fn(w, r)
 			return
 		}
+		if !localHost(r.Host) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host != r.Host {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+		}
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		ip := net.ParseIP(host)
 		if err != nil || ip == nil || !ip.IsLoopback() {
@@ -299,6 +311,17 @@ func apiWith(token string, fn http.HandlerFunc) http.HandlerFunc {
 		}
 		fn(w, r)
 	}
+}
+
+func localHost(host string) bool {
+	if name, _, err := net.SplitHostPort(host); err == nil {
+		host = name
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func tokenMatch(got, want string) bool {

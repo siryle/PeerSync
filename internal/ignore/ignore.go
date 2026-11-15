@@ -78,48 +78,18 @@ func (s Set) Match(rel string, isDir bool) bool {
 	if rel == "." {
 		return false
 	}
-	base := path.Base(rel)
 	for _, p := range s.pats {
-		if p.dirOnly && !isDir {
-			// A directory pattern also ignores everything inside it.
+		for name, dir := rel, isDir; name != "."; name, dir = path.Dir(name), true {
+			if p.dirOnly && !dir {
+				continue
+			}
+			target := name
 			if p.anyDir {
-				if hasDirComponent(rel, p.raw) {
-					return true
-				}
-			} else if insideDir(rel, p) {
+				target = path.Base(name)
+			}
+			if matchGlob(p.raw, target) {
 				return true
 			}
-			continue
-		}
-		if p.anyDir {
-			if matchGlob(p.raw, base) || (isDir && matchGlob(p.raw, rel)) {
-				return true
-			}
-			continue
-		}
-		if matchGlob(p.raw, rel) || (isDir && matchGlob(p.raw, rel)) {
-			return true
-		}
-		if insideDir(rel, p) {
-			return true
-		}
-	}
-	return false
-}
-
-func insideDir(rel string, p pattern) bool {
-	prefix := p.raw
-	return rel == prefix || strings.HasPrefix(rel, prefix+"/")
-}
-
-func hasDirComponent(rel, name string) bool {
-	parts := strings.Split(rel, "/")
-	if len(parts) < 2 {
-		return false
-	}
-	for _, c := range parts[:len(parts)-1] {
-		if matchGlob(name, c) {
-			return true
 		}
 	}
 	return false

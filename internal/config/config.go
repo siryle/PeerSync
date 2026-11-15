@@ -138,11 +138,17 @@ func Load(path string) (Config, bool, error) {
 	if cfg.Shares == nil {
 		cfg.Shares = []Share{}
 	}
+	if err := ValidatePaths(cfg.Shares); err != nil {
+		return Config{}, false, err
+	}
 	return cfg, true, nil
 }
 
 // Save writes the config atomically.
 func Save(path string, cfg Config) error {
+	if err := ValidatePaths(cfg.Shares); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}

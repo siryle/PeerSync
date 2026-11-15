@@ -195,6 +195,9 @@ func (s *session) fetchMeta(task Task) (proto.Meta, error) {
 }
 
 func (s *session) createTemp() (*os.File, string, error) {
+	if err := s.e.checkParents(tmpDirName + "/part"); err != nil {
+		return nil, "", err
+	}
 	if err := s.e.root.MkdirAll(tmpDirName, 0o700); err != nil {
 		return nil, "", err
 	}

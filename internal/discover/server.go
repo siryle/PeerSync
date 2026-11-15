@@ -56,8 +56,9 @@ type Server struct {
 	initOnce sync.Once
 	ready    chan struct{}
 
-	mu    sync.Mutex
-	rooms map[string]*room
+	mu          sync.Mutex
+	rooms       map[string]*room
+	connections map[string]int
 
 	httpAddr string
 	stunAddr string
@@ -94,6 +95,7 @@ func (s *Server) init() {
 		if s.rooms == nil {
 			s.rooms = map[string]*room{}
 		}
+		s.connections = map[string]int{}
 	})
 }
 
@@ -148,7 +150,10 @@ func (s *Server) Run(ctx context.Context) error {
 	})
 	mux.HandleFunc("GET /ws", s.handleWS)
 
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{
+		Handler: mux, ReadHeaderTimeout: 10 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return ctx },
+	}
 	go func() {
 		<-ctx.Done()
 		s.dropAll()
@@ -230,6 +235,27 @@ func (s *Server) reflect(ctx context.Context, conn *net.UDPConn) {
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		http.Error(w, "invalid remote address", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	if s.connections[remoteIP] >= maxConnsPerIP {
+		s.mu.Unlock()
+		http.Error(w, "too many connections", http.StatusTooManyRequests)
+		return
+	}
+	s.connections[remoteIP]++
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.connections[remoteIP]--
+		if s.connections[remoteIP] == 0 {
+			delete(s.connections, remoteIP)
+		}
+		s.mu.Unlock()
+	}()
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		s.Log.Debug("websocket rejected", "err", err)
@@ -241,10 +267,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer conn.CloseNow()
 
 	host := clientHost(r.RemoteAddr)
-	remoteIP := r.RemoteAddr
-	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		remoteIP = ip
-	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.CloseNow() })
+	defer stop()
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
 		return
@@ -260,7 +284,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, data, err := conn.Read(ctx)
+	hctx, hcancel := context.WithTimeout(ctx, 10*time.Second)
+	_, data, err := conn.Read(hctx)
+	hcancel()
 	if err != nil {
 		return
 	}

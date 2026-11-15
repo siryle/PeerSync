@@ -9,7 +9,7 @@ import (
 	"github.com/netcraft/peersync/internal/vclock"
 )
 
-func TestCaseInsensitiveAliasIsNotTombstoned(t *testing.T) {
+func TestCaseInsensitiveScanRetiresMissingSpelling(t *testing.T) {
 	e := testEngine(t, "A")
 	e.caseFold = true
 	putFile(t, filepath.Join(e.Root, "notes.txt"), "local")
@@ -25,8 +25,8 @@ func TestCaseInsensitiveAliasIsNotTombstoned(t *testing.T) {
 	scan(t, e)
 
 	_, entries := e.Entries()
-	if !hasPath(entries, "Notes.txt") {
-		t.Fatalf("case variant was tombstones: %v", entryPaths(entries))
+	if hasPath(entries, "Notes.txt") || !hasPath(entries, "notes.txt") {
+		t.Fatalf("scan retained a spelling absent from the directory: %v", entries)
 	}
 }
 

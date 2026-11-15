@@ -95,7 +95,7 @@ func (n *Node) attempt(ctx context.Context, shareID, peerID string) {
 	dialCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 	tcp, udp := n.peerCandidates(shareID, peerID)
-	ch := make(chan secured, 8)
+	ch := make(chan secured)
 	for _, addr := range tcp {
 		go n.dialTCP(dialCtx, addr, ch)
 	}

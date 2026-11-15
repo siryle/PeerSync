@@ -91,7 +91,7 @@ func TestIndexWriteErrorsPreserveSavedIndex(t *testing.T) {
 		}
 	}
 	e := testEngine(t, "self")
-	if err := e.saveLocked(); err != nil {
+	if err := e.saveSnapshot(e.idx); err != nil {
 		t.Fatal(err)
 	}
 	before, err := os.ReadFile(e.IndexPath)
@@ -102,7 +102,7 @@ func TestIndexWriteErrorsPreserveSavedIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.idx.Seq++
-	if err := e.saveLocked(); err == nil {
+	if err := e.saveSnapshot(e.idx); err == nil {
 		t.Fatal("expected temporary-file write failure")
 	}
 	after, err := os.ReadFile(e.IndexPath)

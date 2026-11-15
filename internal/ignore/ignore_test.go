@@ -8,6 +8,7 @@ func TestMatch(t *testing.T) {
 secret/
 /root-only.txt
 nested/skip.txt
+/cache/*/
 `))
 	cases := []struct {
 		rel  string
@@ -24,6 +25,12 @@ nested/skip.txt
 		{"app.log", false, true},
 		{"secret", true, true},
 		{"secret/a", false, true},
+		{"secret/nested", true, true},
+		{"other/secret/nested", true, true},
+		{"secret", false, false},
+		{"cache/build/artifact.txt", false, true},
+		{"cache/build/deep", true, true},
+		{"other/cache/build/artifact.txt", false, false},
 		{"root-only.txt", false, true},
 		{"sub/root-only.txt", false, false},
 		{"nested/skip.txt", false, true},

@@ -303,9 +303,6 @@ func (c *Controller) CreateShare(path, label string, options ...syncer.Options) 
 	}
 	var code string
 	err = c.mutate(func(cfg *config.Config) error {
-		if err := overlap(cfg.Shares, abs); err != nil {
-			return err
-		}
 		material, err := invite.NewShare()
 		if err != nil {
 			return err
@@ -361,9 +358,6 @@ func (c *Controller) JoinShare(code, path, label string, options ...syncer.Optio
 			if sh.ShareID == id {
 				return errors.New("这台设备已经加入了这个文件夹")
 			}
-		}
-		if err := overlap(cfg.Shares, abs); err != nil {
-			return err
 		}
 		next := cfg.Server
 		if material.Server != "" {
@@ -580,32 +574,6 @@ func cleanDir(path string) (string, error) {
 		return "", errors.New("这不是文件夹")
 	}
 	return abs, nil
-}
-
-func overlap(shares []config.Share, abs string) error {
-	for _, sh := range shares {
-		if pathsOverlap(sh.Path, abs) {
-			return errors.New("这个路径已经在另一个共享文件夹里面")
-		}
-	}
-	return nil
-}
-
-func pathsOverlap(a, b string) bool {
-	a = filepath.Clean(a)
-	b = filepath.Clean(b)
-	if a == b {
-		return true
-	}
-	return inside(a, b) || inside(b, a)
-}
-
-func inside(parent, child string) bool {
-	rel, err := filepath.Rel(parent, child)
-	if err != nil {
-		return false
-	}
-	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func osName(goos string) string {

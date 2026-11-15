@@ -57,6 +57,7 @@ type Engine struct {
 	verifyEvery time.Duration
 
 	mu        sync.Mutex
+	backupMu  sync.Mutex
 	persistMu sync.Mutex
 	idx       indexFile
 	clocks    vclock.Pool
@@ -65,12 +66,13 @@ type Engine struct {
 	kick      chan struct{}
 	// batch coalesces index writes. A reconcile used to rewrite the whole
 	// index once per file, which dominated syncing a large tree.
-	batch      int
-	dirty      bool
-	statsSeq   uint64
-	statsFiles int
-	statsValid bool
-	caseFold   bool
+	batch        int
+	dirty        bool
+	statsSeq     uint64
+	statsFiles   int
+	statsValid   bool
+	caseFold     bool
+	scanComplete bool
 
 	ready     chan struct{}
 	readyOnce sync.Once
@@ -82,9 +84,8 @@ type Options struct {
 	VerifyEvery time.Duration
 }
 
-// Open loads an index. A missing or corrupt index starts empty; the next
-// scan treats every file as a local edit, which converges with identical
-// copies instead of deleting them.
+// Open loads an index. An existing unreadable index stops the share so old
+// remote versions cannot outrank local edits after resetting its clocks.
 func Open(root, indexPath, self string, log *slog.Logger, options ...Options) (*Engine, error) {
 	if log == nil {
 		log = slog.Default()
@@ -128,8 +129,8 @@ func Open(root, indexPath, self string, log *slog.Logger, options ...Options) (*
 		verifyEvery: opt.VerifyEvery,
 	}
 	if err := e.load(); err != nil {
-		e.Log.Warn("index unreadable, scanning as a new folder", "err", err, "path", indexPath)
-		e.idx = indexFile{Files: map[string]*File{}}
+		_ = dir.Close()
+		return nil, fmt.Errorf("index unreadable; restore the index before syncing %s: %w", indexPath, err)
 	}
 	e.caseFold = foldsCase(abs)
 	_ = dir.RemoveAll(tmpDirName)
@@ -201,7 +202,7 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 	} else {
 		verified = time.Now()
 	}
-	ig := e.ignores()
+	ig, _ := e.ignores()
 
 	// Polling keeps its own deadline even while file events keep arriving.
 	poll := time.NewTicker(min(every, e.verifyEvery))
@@ -234,7 +235,7 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 		} else if full {
 			verified = time.Now()
 		}
-		ig = e.ignores()
+		ig, _ = e.ignores()
 	}
 	for {
 		select {
@@ -264,7 +265,7 @@ func (e *Engine) Run(ctx context.Context, every time.Duration) error {
 				paths[rel] = true
 			}
 			// Root events and ignore-rule changes still need a complete walk.
-			if err != nil || rel == ".peersyncignore" {
+			if err != nil || rel == ".peersyncignore" || (e.caseFold && event.Op&fsnotify.Rename != 0) {
 				whole = true
 			}
 			schedule()
@@ -292,7 +293,14 @@ func (e *Engine) scan(full bool) error {
 	return e.scanContext(context.Background(), full, nil)
 }
 
-func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.Watcher, paths ...string) error {
+func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.Watcher, paths ...string) (scanErr error) {
+	defer func() {
+		if scanErr != nil {
+			e.mu.Lock()
+			e.scanComplete = false
+			e.mu.Unlock()
+		}
+	}()
 	started := time.Now()
 	scopes := make(map[string]bool, len(paths))
 	for _, rel := range paths {
@@ -300,6 +308,13 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 			return errors.New("bad scan path")
 		}
 		scopes[rel] = true
+	}
+	e.mu.Lock()
+	complete := e.scanComplete
+	e.mu.Unlock()
+	if !complete {
+		full = true
+		clear(scopes)
 	}
 	paths = nil
 	for rel := range scopes {
@@ -326,7 +341,10 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 		}
 		return false
 	}
-	ig := e.ignores()
+	ig, err := e.ignores()
+	if err != nil {
+		return err
+	}
 	watched := map[string]bool{}
 	watchFailed := false
 	if watcher != nil {
@@ -441,6 +459,9 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 		roots = []string{"."}
 	}
 	for _, root := range roots {
+		if err := e.checkParents(root); err != nil {
+			return err
+		}
 		if err := fs.WalkDir(e.root.FS(), root, walk); err != nil {
 			return err
 		}
@@ -501,6 +522,7 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 		sum, blocks, size, err := e.hashFile(it.rel)
 		if err != nil {
 			e.Log.Debug("hash", "path", it.rel, "err", err)
+			unread = append(unread, it.rel)
 			continue
 		}
 		hashes[it.rel] = hashed{sum: sum, blocks: blocks, size: size}
@@ -526,7 +548,12 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 			continue
 		}
 		if it.dir {
-			if e.upsertDir(it.rel, it.mode) {
+			info, err := e.root.Lstat(it.rel)
+			if err != nil || !info.IsDir() {
+				unread = append(unread, it.rel)
+				continue
+			}
+			if e.upsertDir(it.rel, uint32(info.Mode().Perm())) {
 				changed = true
 			}
 			continue
@@ -545,18 +572,8 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 			changed = true
 		}
 	}
-	var foldSeen map[string]bool
-	if e.caseFold {
-		foldSeen = make(map[string]bool, len(seen))
-		for rel := range seen {
-			foldSeen[foldKey(rel)] = true
-		}
-	}
 	for rel, f := range e.idx.Files {
 		if !inScope(rel) || seen[rel] || f.Deleted || e.inflight[rel] > 0 || unreadCovers(unread, rel) || unreadCovers(links, rel) {
-			continue
-		}
-		if foldSeen != nil && foldSeen[foldKey(rel)] {
 			continue
 		}
 		if ig.Match(rel, f.IsDir) {
@@ -572,16 +589,22 @@ func (e *Engine) scanContext(ctx context.Context, full bool, watcher *fsnotify.W
 		f.Local = e.Mode == config.ReceiveOnly
 		changed = true
 	}
+	becameComplete := !e.scanComplete && len(unread) == 0
+	e.scanComplete = len(unread) == 0
 	if changed {
 		e.idx.Seq++
+	}
+	if changed || e.dirty {
 		if err := e.persistLocked(); err != nil {
 			return err
 		}
+	} else if becameComplete {
+		e.notify()
 	}
-	e.markReady()
 	if len(unread) > 0 {
 		return fmt.Errorf("scan incomplete, left %s unchanged", unread[0])
 	}
+	e.markReady()
 	e.Log.Debug("scan complete", "root", e.Root, "full", full, "scoped", len(paths) > 0, "paths", len(items), "changed", changed, "elapsed", time.Since(started))
 	return nil
 }
@@ -596,18 +619,21 @@ func unreadCovers(unread []string, rel string) bool {
 	return false
 }
 
-func (e *Engine) ignores() ignore.Set {
+func (e *Engine) ignores() (ignore.Set, error) {
 	s := ignore.Defaults()
 	f, err := e.openFile(".peersyncignore")
+	if errors.Is(err, os.ErrNotExist) {
+		return s, nil
+	}
 	if err != nil {
-		return s
+		return s, fmt.Errorf("read ignore rules: %w", err)
 	}
 	defer f.Close()
 	b, err := io.ReadAll(f)
 	if err != nil {
-		return s
+		return s, fmt.Errorf("read ignore rules: %w", err)
 	}
-	return s.Merge(ignore.Parse(string(b)))
+	return s.Merge(ignore.Parse(string(b))), nil
 }
 
 func (e *Engine) upsertDir(rel string, mode uint32) bool {
@@ -651,7 +677,7 @@ func (e *Engine) upsertFile(rel string, size, mtime int64, mode uint32, sum [32]
 		ver = prev.Version
 	}
 	e.idx.Files[rel] = &File{
-		Size: size, ModTime: mtime, Mode: mode,
+		Size: size, ModTime: mtime, Mode: mode, Mode0: zero,
 		Sum: sum, Blocks: blocks, Version: e.clocks.Intern(vclock.Bump(ver, e.Self)),
 		Local: e.Mode == config.ReceiveOnly,
 	}
@@ -667,6 +693,10 @@ func (e *Engine) Entries() (uint64, []proto.Entry) {
 func (e *Engine) entries(cloneVersions bool) (uint64, []proto.Entry) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.entriesLocked(cloneVersions)
+}
+
+func (e *Engine) entriesLocked(cloneVersions bool) (uint64, []proto.Entry) {
 	out := make([]proto.Entry, 0, len(e.idx.Files))
 	for p, f := range e.idx.Files {
 		version := f.Version
@@ -693,13 +723,20 @@ func (e *Engine) Plan(remote []proto.Entry) []Task {
 	if e.Mode == config.SendOnly {
 		return nil
 	}
-	ig := e.ignores()
+	ig, err := e.ignores()
+	if err != nil {
+		e.Log.Warn("sync plan blocked", "err", err)
+		return nil
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	owners := e.foldOwners()
 	filtered := make([]proto.Entry, 0, len(remote))
 	var holds []Task
 	for _, entry := range remote {
+		if !ValidRel(entry.Path) || ig.Match(entry.Path, entry.IsDir) {
+			continue
+		}
 		if owner, ok := owners[foldKey(entry.Path)]; ok && owner != entry.Path {
 			if !entry.IsDir && !entry.Deleted {
 				holds = append(holds, Task{Op: opPull, Path: entry.Path, Remote: entry, Version: vclock.Clone(entry.Version), Hold: true})
@@ -740,8 +777,15 @@ func (e *Engine) fileBlocks(rel string) (sum [32]byte, blocks [][32]byte, size i
 	if !ValidRel(rel) {
 		return sum, nil, 0, errors.New("bad path")
 	}
-	if e.ignores().Match(rel, false) {
+	ig, err := e.ignores()
+	if err != nil {
+		return sum, nil, 0, err
+	}
+	if ig.Match(rel, false) {
 		return sum, nil, 0, os.ErrNotExist
+	}
+	if err := e.checkParents(rel); err != nil {
+		return sum, nil, 0, err
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -812,13 +856,14 @@ func (e *Engine) ApplyDelete(task Task) error {
 			return err
 		}
 	}
-	if err := e.root.Remove(task.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		if info, statErr := e.root.Lstat(task.Path); statErr == nil && info.IsDir() && e.removeIgnoredLeftovers(task.Path) {
-			err = nil
+	if err := e.withWritableParents(task.Path, func() error {
+		err := e.root.Remove(task.Path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
 		}
-		if err != nil {
-			return err
-		}
+		return err
+	}); err != nil {
+		return err
 	}
 	e.idx.Files[task.Path] = &File{Deleted: true, IsDir: task.Remote.IsDir, Version: e.clocks.Intern(task.Version)}
 	e.idx.Seq++
@@ -867,14 +912,21 @@ func (e *Engine) ApplyDir(task Task) error {
 		if err := e.checkLocalLocked(task); err != nil {
 			return err
 		}
-		if err := e.root.Remove(task.Path); err != nil {
+	}
+	var info os.FileInfo
+	err := e.withWritableParents(task.Path, func() error {
+		if cur := e.idx.Files[task.Path]; cur != nil && !cur.Deleted && !cur.IsDir {
+			if err := e.root.Remove(task.Path); err != nil {
+				return err
+			}
+		}
+		if err := e.root.MkdirAll(task.Path, fileMode(task.Remote.Mode, task.Remote.Mode0, true)); err != nil {
 			return err
 		}
-	}
-	if err := e.root.MkdirAll(task.Path, fileMode(task.Remote.Mode, task.Remote.Mode0, true)); err != nil {
+		var err error
+		info, err = e.setMetadata(task.Path, task.Remote)
 		return err
-	}
-	info, err := e.setMetadata(task.Path, task.Remote)
+	})
 	if err != nil {
 		return err
 	}
@@ -908,6 +960,19 @@ func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if task.Hold {
+		if !ValidRel(task.Path) {
+			return errors.New("bad path")
+		}
+		ig, err := e.ignores()
+		if err != nil {
+			return err
+		}
+		if ig.Match(task.Path, false) {
+			return errIgnored
+		}
+		if err := e.checkParents(task.Path); err != nil {
+			return err
+		}
 		return e.backupIncomingLocked(task, tmp)
 	}
 	if err := e.checkLocalLocked(task); err != nil {
@@ -918,30 +983,37 @@ func (e *Engine) CommitDownload(task Task, tmp string, blocks [][32]byte) error 
 			return err
 		}
 	}
-	if err := e.root.MkdirAll(path.Dir(task.Path), 0o755); err != nil {
-		return err
-	}
-	info, err := e.setMetadata(tmp, task.Remote)
-	if err != nil {
-		return err
-	}
 	if task.Op == opConflict || task.Backup {
 		if err := e.checkLocalLocked(task); err != nil {
 			return err
 		}
 	}
-	cur := e.idx.Files[task.Path]
-	replacingDir := cur != nil && !cur.Deleted && cur.IsDir
-	if replacingDir {
-		// Remove only an empty directory; unsynced children must survive.
-		if err := e.root.Remove(task.Path); err != nil {
+	var info os.FileInfo
+	err := e.withWritableParents(task.Path, func() error {
+		if err := e.root.MkdirAll(path.Dir(task.Path), 0o755); err != nil {
 			return err
 		}
-	}
-	if err := e.root.Rename(tmp, task.Path); err != nil {
-		if replacingDir {
-			return errors.Join(err, e.root.Mkdir(task.Path, fileMode(cur.Mode, cur.Mode0, true)))
+		var err error
+		info, err = e.setMetadata(tmp, task.Remote)
+		if err != nil {
+			return err
 		}
+		cur := e.idx.Files[task.Path]
+		replacingDir := cur != nil && !cur.Deleted && cur.IsDir
+		if replacingDir {
+			if err := e.root.Remove(task.Path); err != nil {
+				return err
+			}
+		}
+		if err := e.root.Rename(tmp, task.Path); err != nil {
+			if replacingDir {
+				return errors.Join(err, e.root.Mkdir(task.Path, fileMode(cur.Mode, cur.Mode0, true)))
+			}
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
 	perm := uint32(info.Mode().Perm())
@@ -997,17 +1069,15 @@ func (e *Engine) EndBatch() {
 	if e.batch > 0 || !e.dirty {
 		return
 	}
-	e.dirty = false
 	if err := e.persistLocked(); err != nil {
-		e.dirty = true
 		e.Log.Warn("save index", "err", err)
 	}
 }
 
 // persistLocked writes the index unless a batch is open.
 func (e *Engine) persistLocked() error {
+	e.dirty = true
 	if e.batch > 0 {
-		e.dirty = true
 		return nil
 	}
 	snap := cloneIndex(e.idx)
@@ -1016,6 +1086,9 @@ func (e *Engine) persistLocked() error {
 	e.mu.Lock()
 	if err != nil {
 		return err
+	}
+	if e.idx.Seq == snap.Seq {
+		e.dirty = false
 	}
 	e.notify()
 	return nil
@@ -1049,8 +1122,8 @@ func foldKey(p string) string { return strings.ToLower(p) }
 // foldsCase reports whether the filesystem treats names that differ only by
 // case as the same file.
 func foldsCase(root string) bool {
-	probe := filepath.Join(root, tmpDirName)
-	if err := os.MkdirAll(probe, 0o700); err != nil {
+	probe, err := os.MkdirTemp(root, ".peersync-probe-")
+	if err != nil {
 		return false
 	}
 	defer os.RemoveAll(probe)
@@ -1058,7 +1131,7 @@ func foldsCase(root string) bool {
 	if err := os.WriteFile(name, []byte("x"), 0o600); err != nil {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(probe, "caseprobe"))
+	_, err = os.Stat(filepath.Join(probe, "caseprobe"))
 	return err == nil
 }
 
@@ -1079,27 +1152,4 @@ func (e *Engine) foldOwners() map[string]string {
 		}
 	}
 	return owners
-}
-
-// removeIgnoredLeftovers removes a directory that failed a normal Remove only
-// when every remaining entry is ignored. Synced files must keep the directory
-// so a failed parent delete is never reported as a completed deletion.
-func (e *Engine) removeIgnoredLeftovers(rel string) bool {
-	ig := e.ignores()
-	ok := true
-	_ = fs.WalkDir(e.root.FS(), rel, func(name string, d fs.DirEntry, err error) error {
-		if err != nil || name == rel {
-			return nil
-		}
-		child := filepath.ToSlash(name)
-		if d.Type()&os.ModeSymlink != 0 || !ig.Match(child, d.IsDir()) {
-			ok = false
-			return fs.SkipAll
-		}
-		return nil
-	})
-	if !ok {
-		return false
-	}
-	return e.root.RemoveAll(rel) == nil
 }
